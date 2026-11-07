@@ -185,7 +185,7 @@ const routes = [];
 const route = (method, pattern, opts, fn) => routes.push({ method, re: new RegExp('^' + pattern.replace(/:(\w+)/g, '(?<$1>[^/]+)') + '$'), opts, fn });
 
 /* ---------- OTP via Supabase Auth (production) ----------
-   Supabase Auth sends the 6-digit code by e-mail and owns verification.
+   Supabase Auth sends the 8-digit code by e-mail and owns verification.
    The code is never generated, stored, logged or returned by this server.
    NOTE: Supabase's built-in e-mail only delivers to project team members
    (2/hour). For real users, configure a custom SMTP server in the Supabase
@@ -223,7 +223,7 @@ route('POST', '/api/auth/start', { anon: true }, async (c) => {
     try { await sendOtpEmail(contact); } catch (e) { console.error('otp send failed for', contact + ':', e.message); return c.err(500, 'server_error'); }
     return c.json(200, { ok: true });
   }
-  const code = String(100000 + crypto.randomInt(900000));
+  const code = String(10000000 + crypto.randomInt(90000000));   // 8 digits, matching Supabase Auth OTP length
   otps[contact] = { code, exp: Date.now() + 600000, tries: 0 };
   c.json(200, DEV_OTP ? { ok: true, devCode: code } : { ok: true });   // DEV_OTP=1 only, local dev
 });
@@ -232,12 +232,12 @@ route('POST', '/api/auth/verify', { anon: true }, async (c) => {
   if (!rate('verifyip:' + c.ip, 40, 3600000)) return c.err(429, 'rate_limited');
   if (USE_SB) {
     let ok = false;
-    try { ok = await verifyOtpEmail(contact, S(c.body.code, 6)); } catch (e) { console.error('otp verify failed for', contact + ':', e.message); return c.err(500, 'server_error'); }
+    try { ok = await verifyOtpEmail(contact, S(c.body.code, 8)); } catch (e) { console.error('otp verify failed for', contact + ':', e.message); return c.err(500, 'server_error'); }
     if (!ok) return c.err(400, 'bad_code');
   } else {
     const o = otps[contact];
     if (!o || o.exp < Date.now() || ++o.tries > 5) return c.err(400, 'bad_code');
-    if (S(c.body.code, 6) !== o.code) return c.err(400, 'bad_code');
+    if (S(c.body.code, 8) !== o.code) return c.err(400, 'bad_code');
     delete otps[contact];
   }
   let u = Object.values(db.users).find(x => x.contact === contact);
