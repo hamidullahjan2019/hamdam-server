@@ -1,0 +1,1 @@
+{"description":"Hamdam matchmaking app server — zero dependencies, Supabase Postgres or JSON-file store","engines":{"node":">=18"},"main":"server.js","name":"hamdam-server","private":true,"scripts":{"start":"node server.js"},"version":"1.0.0"}

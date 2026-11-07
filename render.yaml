@@ -1,0 +1,31 @@
+# Render Blueprint — deploys the Hamdam server as a free web service.
+# Usage: push this folder to a git repo, then in Render: New -> Blueprint
+# and point it at the repo. Fill in the `sync: false` values in the
+# Render dashboard (they are secrets and are never stored in git).
+services:
+  - type: web
+    name: hamdam-server
+    runtime: node
+    plan: free
+    buildCommand: npm install
+    startCommand: node server.js
+    healthCheckPath: /api/health
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: DEV_OTP
+        value: "0"
+      - key: DEV_GOLD
+        value: "0"
+      - key: ALLOW_ORIGIN
+        value: https://fastidious-pixie-4c8929.netlify.app
+      - key: PUBLIC_URL
+        sync: false
+      - key: ADMIN_KEY
+        sync: false
+      - key: SUPABASE_URL
+        sync: false
+      - key: SUPABASE_ANON_KEY
+        sync: false
+      - key: SUPABASE_SERVICE_ROLE_KEY
+        sync: false
