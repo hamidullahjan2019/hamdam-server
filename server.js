@@ -72,8 +72,8 @@ async function sbUpsert(table, rows, onConflict) {
 async function sbDelete(table, col, val) {
   await sbReq('DELETE', '/rest/v1/' + table + '?' + col + '=eq.' + encodeURIComponent(val), undefined, 'return=minimal');
 }
-const userToRow = u => ({ id: u.id, contact: u.contact, me: u.me || null, ver: u.ver || 0, gold: !!u.gold, wali_code: u.waliCode || '', blocked: u.blocked || {}, reacts: u.reacts || {}, hist: u.hist || [], unlocked: u.unlocked || {}, media: u.media || [], selfie: u.selfie || null, seen: u.seen || 0, created_at: u.createdAt || 0 });
-const userFromRow = r => ({ id: r.id, contact: r.contact, me: r.me, ver: r.ver, gold: !!r.gold, waliCode: r.wali_code || '', blocked: r.blocked || {}, reacts: r.reacts || {}, hist: r.hist || [], unlocked: r.unlocked || {}, media: r.media || [], createdAt: r.created_at || 0, seen: r.seen || 0, selfie: r.selfie || undefined });
+const userToRow = u => ({ id: u.id, contact: u.contact, me: u.me || null, ver: u.ver || 0, gold: !!u.gold, wali_code: u.waliCode || '', blocked: u.blocked || {}, reacts: u.reacts || {}, hist: u.hist || [], unlocked: u.unlocked || {}, media: u.media || [], selfie: u.selfie || null, seen: u.seen || 0, created_at: u.createdAt || 0, compliments: u.compliments || {}, react_at: u.reactAt || {}, visits: u.visits || {} });
+const userFromRow = r => ({ id: r.id, contact: r.contact, me: r.me, ver: r.ver, gold: !!r.gold, waliCode: r.wali_code || '', blocked: r.blocked || {}, reacts: r.reacts || {}, hist: r.hist || [], unlocked: r.unlocked || {}, media: r.media || [], createdAt: r.created_at || 0, seen: r.seen || 0, selfie: r.selfie || undefined, compliments: r.compliments || {}, reactAt: r.react_at || {}, visits: r.visits || {} });
 const reportToRow = r => ({ id: r.id, t: r.t, by_user: r.by, about: r.about, reason: r.reason || '', context: r.context || [], status: r.status || 'open' });
 const reportFromRow = r => ({ id: r.id, t: r.t, by: r.by_user, about: r.about, reason: r.reason, context: r.context || [], status: r.status });
 async function storeLoad() {               // Supabase -> in-memory db (throws on failure)
@@ -160,10 +160,12 @@ function activeChats(uid) { return matchesOf(uid).filter(k => db.matches[k].msgs
 function viewMsg(m, uid) { const o = { f: m.from === uid ? 'me' : 'them', t: m.t }; if (m.text) o.text = m.text; if (m.img) o.img = m.img; if (m.audio) { o.audio = m.audio; o.dur = m.dur; } if (m.from === uid && m.readAt) o.read = true; return o; }
 function publicProfile(u, viewer) {
   const me = u.me, unlocked = !!(viewer.unlocked && viewer.unlocked[u.id]);
-  return { id: u.id, name: me.name, age: me.age, height: me.height || 0, city: me.city, job: me.job, g: me.g, intent: me.intent, prayer: me.prayer, langs: me.langs || '', about: me.about, q: [], int: me.int || [],
+  return { id: u.id, name: me.name, username: me.username || '', age: me.age, height: me.height || 0, country: me.country || '', state: me.state || '', city: me.city, job: me.job, edu: me.edu || '', marital: me.marital || '', children: me.children || '', smoke: me.smoke || '', drink: me.drink || '', g: me.g, intent: me.intent, prayer: me.prayer, langs: me.langs || '', about: me.about, q: [], int: me.int || [],
+    nationality: me.nationality || '', grewUp: me.grewUp || '', sect: me.sect || '', ethnicity: me.ethnicity || '', marriagePlans: me.marriagePlans || '', relocationPlans: me.relocationPlans || '', familyPlans: me.familyPlans || '', dress: me.dress || '', diet: me.diet || '', faith: me.faith || [], personality: me.personality || [], polygamy: me.polygamy || '', parents: me.parents || '', top3: me.top3 || '',
+    joined: u.createdAt || 0, gold: !!u.gold, filters: me.myFilters || null,
     ver: u.ver === 2, priv: !!me.blur, photos: (!me.blur || unlocked) ? (me.photos || []) : [], online: Date.now() - (u.seen || 0) < 120000 };
 }
-function ownMe(u) { return Object.assign({}, u.me, { id: u.id, ver: u.ver, gold: !!u.gold, wali: !!u.me.wali, waliCode: u.waliCode || '', done: true }); }
+function ownMe(u) { return Object.assign({}, u.me, { id: u.id, ver: u.ver, gold: !!u.gold, wali: !!u.me.wali, waliCode: u.waliCode || '', done: true, joined: u.createdAt || 0 }); }
 function stateFor(u) {
   const matches = {}; for (const k of matchesOf(u.id)) { const m = db.matches[k], o = otherOf(k, u.id); matches[o] = { t: m.t, unread: m.msgs.filter(x => x.from !== u.id && !x.readAt).length, msgs: m.msgs.map(x => viewMsg(x, u.id)) }; }
   const acted = {}; for (const k in u.reacts) acted[k] = u.reacts[k];
@@ -241,7 +243,7 @@ route('POST', '/api/auth/verify', { anon: true }, async (c) => {
     delete otps[contact];
   }
   let u = Object.values(db.users).find(x => x.contact === contact);
-  if (!u) { u = db.users[db.seq] = { id: db.seq++, contact, me: null, ver: 0, gold: false, waliCode: '', blocked: {}, reacts: {}, hist: [], unlocked: {}, media: [], createdAt: Date.now() }; }
+  if (!u) { u = db.users[db.seq] = { id: db.seq++, contact, me: null, ver: 0, gold: false, waliCode: '', blocked: {}, reacts: {}, hist: [], unlocked: {}, media: [], createdAt: Date.now(), compliments: {}, reactAt: {}, visits: {} }; }
   const token = crypto.randomBytes(32).toString('hex'); db.sessions[token] = u.id; save();
   c.json(200, { token });
 });
@@ -249,7 +251,8 @@ route('POST', '/api/logout', {}, (c) => { delete db.sessions[c.token]; save(); c
 
 route('GET', '/api/me', {}, (c) => {
   const u = c.user, q = db.events[u.id] || [];
-  c.json(200, { me: hasProfile(u) ? ownMe(u) : null, state: stateFor(u), cursor: q.length ? q[q.length - 1].id : 0 });
+  const compliments = Object.values(db.users).filter(x => x.compliments && x.compliments[u.id]).length;
+  c.json(200, { me: hasProfile(u) ? ownMe(u) : null, state: stateFor(u), cursor: q.length ? q[q.length - 1].id : 0, compliments });
 });
 route('PUT', '/api/me', {}, (c) => {
   const b = c.body, u = c.user, age = Math.floor(+b.age);
@@ -257,9 +260,19 @@ route('PUT', '/api/me', {}, (c) => {
   const prev = u.me || {};
   const photos = (Array.isArray(b.photos) ? b.photos : []).filter(x => u.media.includes(x)).slice(0, 3);
   u.me = {
-    name: S(b.name, 24) || 'You', age, city: S(b.city, 40), job: S(b.job, 30), about: S(b.about, 140), g: b.g === 'f' ? 'f' : 'm',
+    name: S(b.name, 24) || 'You', username: (b.username || '').toLowerCase().replace(/[^a-z0-9._-]/g, '').slice(0, 20), age, country: S(b.country, 40), state: S(b.state, 40), city: S(b.city, 40), job: S(b.job, 30), edu: S(b.edu, 40),
+    marital: ['single', 'divorced', 'widowed'].includes(b.marital) ? b.marital : '', children: ['none', 'have', 'want'].includes(b.children) ? b.children : '',
+    height: Math.max(0, Math.min(250, Math.floor(+b.height) || prev.height || 0)),
+    smoke: ['no', 'sometimes', 'yes'].includes(b.smoke) ? b.smoke : '', drink: ['no', 'sometimes', 'yes'].includes(b.drink) ? b.drink : '',
+    about: S(b.about, 140), g: b.g === 'f' ? 'f' : 'm',
     intent: ['marriage', 'friends', 'both'].includes(b.intent) ? b.intent : 'both', prayer: ['a', 's', 't'].includes(b.prayer) ? b.prayer : 'a',
-    int: (Array.isArray(b.int) ? b.int : []).map(x => S(x, 20)).slice(0, 10), langs: prev.langs || '', height: prev.height || 0,
+    int: (Array.isArray(b.int) ? b.int : []).map(x => S(x, 20)).slice(0, 10), langs: S(b.langs, 120),
+    nationality: S(b.nationality, 40), grewUp: S(b.grewUp, 40), sect: S(b.sect, 40), ethnicity: S(b.ethnicity, 40),
+    marriagePlans: ['soon', 'year', 'two', 'unsure'].includes(b.marriagePlans) ? b.marriagePlans : '', relocationPlans: ['open', 'global', 'no', 'unsure'].includes(b.relocationPlans) ? b.relocationPlans : '', familyPlans: ['want', 'notwant', 'unsure', 'have'].includes(b.familyPlans) ? b.familyPlans : '',
+    dress: S(b.dress, 20), diet: ['halal', 'veg', 'vegan', 'any'].includes(b.diet) ? b.diet : '',
+    faith: (Array.isArray(b.faith) ? b.faith : []).map(x => S(x, 30)).slice(0, 12), personality: (Array.isArray(b.personality) ? b.personality : []).map(x => S(x, 20)).slice(0, 12),
+    polygamy: ['no', 'open', 'unsure'].includes(b.polygamy) ? b.polygamy : '', parents: S(b.parents, 80), top3: S(b.top3, 120),
+    myFilters: (() => { const mf = b.myFilters; if (mf === undefined) return prev.myFilters || null; if (!mf || typeof mf !== 'object') return null; const pick = (src, keys) => { const o = {}; for (const k of keys) if (src[k] !== undefined) o[k] = src[k]; return o; }; return { f: pick(mf.f || {}, ['min', 'max', 'country', 'state', 'city', 'nationality', 'hmin', 'hmax', 'marital', 'children', 'grewUp', 'lang', 'edu', 'profession', 'int', 'marriagePlans', 'relocationPlans', 'familyPlans', 'prayer', 'dress', 'diet', 'smoke', 'drink', 'sect', 'ethnicity']), fg: pick(mf.fg || {}, ['liked', 'bio', 'online', 'goldMember', 'justJoined', 'priv', 'ver', 'born']), fmode: mf.fmode === 'gold' ? 'gold' : 'simple' }; })(),
     blur: !!b.blur, wali: !!b.wali, womenFirst: !!b.womenFirst, incog: !!b.incog, dist: b.dist !== false, theme: ['dark', 'light'].includes(b.theme) ? b.theme : '', lang: b.lang === 'en' ? 'en' : 'ps', photos
   };
   save(); c.json(200, { me: ownMe(u) });
@@ -284,7 +297,7 @@ route('GET', '/api/profiles', {}, (c) => {
 });
 route('GET', '/api/likes-you', {}, (c) => {
   const u = c.user, ids = [];
-  for (const o of Object.values(db.users)) { if (o.id !== u.id && hasProfile(o) && !isBlocked(u.id, o.id) && (o.reacts[u.id] === 'like' || o.reacts[u.id] === 'super') && !u.reacts[o.id]) ids.push(o.id); }
+  for (const o of Object.values(db.users)) { if (o.id !== u.id && hasProfile(o) && !isBlocked(u.id, o.id) && (o.reacts[u.id] === 'like' || o.reacts[u.id] === 'super') && !u.reacts[o.id]) ids.push({ id: o.id, t: (o.reactAt && o.reactAt[u.id]) || 0 }); }
   c.json(200, { ids });
 });
 route('POST', '/api/react', {}, (c) => {
@@ -292,14 +305,35 @@ route('POST', '/api/react', {}, (c) => {
   if (!hasProfile(u)) return c.err(400, 'no_profile');
   if (!['like', 'pass', 'super'].includes(kind) || !hasProfile(o) || o.id === u.id || o.me.g === u.me.g || isBlocked(u.id, id)) return c.err(400, 'blocked');
   if (!rate('react:' + u.id, 300, 3600000)) return c.err(429, 'rate_limited');
-  u.reacts[id] = kind; u.hist.push(id); let match = false;
+  const compliment = S(c.body.compliment, 120);
+  u.reacts[id] = kind; u.hist.push(id); u.reactAt = u.reactAt || {}; u.reactAt[id] = Date.now();
+  if (compliment && kind !== 'pass') { u.compliments = u.compliments || {}; u.compliments[id] = { text: compliment, t: Date.now() }; }
+  let match = false, matchMsgs = null;
   if (kind !== 'pass') {
     if (o.reacts[u.id] === 'like' || o.reacts[u.id] === 'super') {
       const k = mkey(u.id, id); if (!db.matches[k]) db.matches[k] = { t: Date.now(), msgs: [] };
-      match = true; emit(id, { type: 'match', id: u.id });
-    } else emit(id, { type: 'like', id: u.id });
+      const pushComp = (fromId, text) => { if (text && !db.matches[k].msgs.some(x => x.text === text && x.from === fromId)) db.matches[k].msgs.push({ from: fromId, t: Date.now(), text }); };
+      if (o.compliments && o.compliments[u.id]) pushComp(o.id, o.compliments[u.id].text);
+      pushComp(u.id, compliment);
+      match = true; matchMsgs = db.matches[k].msgs.map(x => viewMsg(x, u.id)); emit(id, { type: 'match', id: u.id, compliment: compliment || '' });
+    } else {
+      emit(id, { type: 'like', id: u.id });
+    }
   }
-  save(); c.json(200, { match });
+  save(); c.json(200, { match, msgs: matchMsgs });
+});
+route('POST', '/api/visit', {}, (c) => {
+  const u = c.user, id = +c.body.id, o = db.users[id];
+  if (!hasProfile(u) || !hasProfile(o) || o.id === u.id || isBlocked(u.id, id) || u.me.incog) return c.json(200, { ok: true });
+  o.visits = o.visits || {}; o.visits[u.id] = Date.now(); save(); c.json(200, { ok: true });
+});
+route('GET', '/api/visits', {}, (c) => {
+  const u = c.user, out = [], now = Date.now();
+  for (const k in (u.visits || {})) { const t = u.visits[k]; if (now - t > 30 * 86400000) { delete u.visits[k]; continue; } const v = db.users[+k]; if (v && hasProfile(v) && !isBlocked(u.id, v.id)) out.push({ id: v.id, t }); }
+  out.sort((a, b) => b.t - a.t); c.json(200, out);
+});
+route('POST', '/api/reset-history', {}, (c) => {
+  const u = c.user; u.reacts = {}; u.hist = []; save(); c.json(200, { ok: true });
 });
 route('POST', '/api/undo', {}, (c) => {
   const u = c.user; if (!u.gold) return c.err(403, 'not_gold');
