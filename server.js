@@ -216,6 +216,33 @@ async function verifyOtpEmail(contact, code) {
   return r.ok;
 }
 
+/* ---------- Google OAuth sign-in ----------
+   The app redirects the user to Supabase's Google authorize URL; Supabase
+   returns to the app with a Supabase access_token in the URL hash. The app
+   POSTs that token here; we validate it against Supabase Auth (GET
+   /auth/v1/user) and, on success, sign the user into the Hamdam app with the
+   exact same find-or-create + session logic as the OTP verify route. The
+   Google Client Secret is never used here — it lives only in Supabase. */
+function sessionForContact(contact) {
+  let u = Object.values(db.users).find(x => x.contact === contact);
+  if (!u) { u = db.users[db.seq] = { id: db.seq++, contact, me: null, ver: 0, gold: false, waliCode: '', blocked: {}, reacts: {}, hist: [], unlocked: {}, media: [], createdAt: Date.now(), compliments: {}, reactAt: {}, visits: {} }; }
+  const token = crypto.randomBytes(32).toString('hex'); db.sessions[token] = u.id; save();
+  return token;
+}
+async function supabaseUserByToken(token) {
+  let r;
+  try {
+    r = await fetch(SB_URL + '/auth/v1/user', {
+      method: 'GET',
+      headers: { apikey: SB_ANON, Authorization: 'Bearer ' + token },
+    });
+  } catch (e) { throw new Error('supabase user lookup failed: ' + e.message); }
+  if (!r.ok) return null;
+  const j = await r.json().catch(() => null);
+  const email = j && typeof j.email === 'string' ? j.email.trim() : '';
+  return email || null;
+}
+
 route('POST', '/api/auth/start', { anon: true }, async (c) => {
   const contact = S(c.body.contact, 120).toLowerCase();
   if (!/^\S+@\S+\.\S+$/.test(contact)) return c.err(400, 'bad_contact');
@@ -242,10 +269,17 @@ route('POST', '/api/auth/verify', { anon: true }, async (c) => {
     if (S(c.body.code, 8) !== o.code) return c.err(400, 'bad_code');
     delete otps[contact];
   }
-  let u = Object.values(db.users).find(x => x.contact === contact);
-  if (!u) { u = db.users[db.seq] = { id: db.seq++, contact, me: null, ver: 0, gold: false, waliCode: '', blocked: {}, reacts: {}, hist: [], unlocked: {}, media: [], createdAt: Date.now(), compliments: {}, reactAt: {}, visits: {} }; }
-  const token = crypto.randomBytes(32).toString('hex'); db.sessions[token] = u.id; save();
-  c.json(200, { token });
+  c.json(200, { token: sessionForContact(contact) });
+});
+route('POST', '/api/auth/oauth', { anon: true }, async (c) => {
+  if (!rate('oauthip:' + c.ip, 40, 3600000)) return c.err(429, 'rate_limited');
+  const token = String(c.body.token || '').trim();
+  if (!token) return c.err(400, 'bad_token');
+  if (!SB_URL || !SB_ANON) return c.err(500, 'server_error');   // Supabase Auth not configured
+  let email = null;
+  try { email = await supabaseUserByToken(token); } catch (e) { console.error('oauth user lookup failed:', e.message); return c.err(500, 'server_error'); }
+  if (!email) return c.err(401, 'bad_token');
+  c.json(200, { token: sessionForContact(email.toLowerCase()) });
 });
 route('POST', '/api/logout', {}, (c) => { delete db.sessions[c.token]; save(); c.json(200, { ok: true }); });
 
