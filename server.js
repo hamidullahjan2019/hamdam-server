@@ -15,7 +15,10 @@
    Env:  PORT, PUBLIC_URL, DATA_FILE, ADMIN_KEY, ALLOW_ORIGIN,
          SUPABASE_URL, SUPABASE_ANON_KEY, SUPABASE_SERVICE_ROLE_KEY,
          DEV_OTP=1 (return the code in the response — local dev only, default off),
-         DEV_GOLD=1 (trial gold without billing — dev only) */
+         DEV_GOLD=1 (trial gold without billing — dev only),
+         HESABPAY_API_KEY (live Gold payments; without it /api/checkout stays disabled),
+         HESABPAY_ENV=sandbox (use the HesabPay sandbox API),
+         HESABPAY_BASE_URL, HESABPAY_RATE (tests only — override the API base / AFN rate) */
 'use strict';
 const http = require('http'), fs = require('fs'), path = require('path'), crypto = require('crypto');
 const PORT = +process.env.PORT || 8787;
@@ -29,6 +32,92 @@ const SB_URL = (process.env.SUPABASE_URL || '').replace(/\/$/, '');
 const SB_ANON = process.env.SUPABASE_ANON_KEY || '';
 const SB_SERVICE = process.env.SUPABASE_SERVICE_ROLE_KEY || '';
 const USE_SB = !!(SB_URL && SB_SERVICE);       // Supabase store enabled only when both are set
+
+/* ---------- HesabPay Gold payments ($5 / 30 days) ----------
+   Contract — read from the official WooCommerce plugins (2026-11-08):
+   - habib-studio/hesabpay-payment-gateway, includes/class-wc-gateway-hesabpay.php:
+     POST https://api.hesab.com/api/v1/payment/create-session
+     headers: Authorization: 'API-KEY <key>', Content-Type: application/json
+     body: {items:[{id, name, price}]} ; response: {url} (the payment page).
+     Webhook payload: {status_code, signature, timestamp, transaction_id,
+     items:[{id,...}], success}; success = status_code===10 && success===true;
+     order id = items[0].id; signature verified locally as md5(api_key+timestamp).
+   - XAbubakr/hesabpay-gateway-for-woocommerce v1.0.2 (main file):
+     same endpoint; payload {order_id, items:[{id, product_id, name, price}],
+     email, callback_url, success_url, cancel_url}; price is an INTEGER in AFN
+     (USD total x live USD->AFN rate, rounded); webhook verified via
+     POST {base}/api/v1/hesab/webhooks/verify-signature with header
+     Authorization: 'API-KEY <key>' and body {signature, timestamp};
+     response {success:true} means valid. Sandbox base:
+     https://api-sandbox.hesab.com (sandbox API key from the dashboard).
+   NOT settled by the plugin sources (assumptions — confirm with HesabPay):
+   - whether per-session callback_url/success_url are honoured, or the merchant
+     dashboard's URLs override them (both are sent AND the webhook URL must
+     also be registered in the HesabPay Developer Dashboard);
+   - sandbox key availability (a dashboard setting per the plugin);
+   - HesabPay's per-transaction fee (not in the plugin source).
+   Pending Gold orders live in db.goldOrders and are persisted to the Supabase
+   kv table (key 'gold_orders') so a server restart/sleep between checkout and
+   the webhook cannot lose them. Gold expiry lives in the user's profile
+   (me.goldUntil, milliseconds) — no schema change; PUT /api/me preserves it
+   from the previous profile, exactly like myFilters. */
+const GOLD_PRICE_USD = 5;
+const GOLD_DAYS = 30;
+const GOLD_DAY_MS = 86400000;
+const HESABPAY_KEY = process.env.HESABPAY_API_KEY || '';
+const HESABPAY_LIVE = 'https://api.hesab.com';
+const HESABPAY_SANDBOX = 'https://api-sandbox.hesab.com';
+const HESABPAY_BASE = process.env.HESABPAY_BASE_URL || (process.env.HESABPAY_ENV === 'sandbox' ? HESABPAY_SANDBOX : HESABPAY_LIVE);
+const HESABPAY_FALLBACK_RATE = 70;   // AFN per USD — used only if the live rate fetch fails
+const APP_URL = 'https://fastidious-pixie-4c8929.netlify.app';   // return URL host for Gold payments
+function isGold(u) { return !!u && !!u.gold && !(u.me && u.me.goldUntil && u.me.goldUntil <= Date.now()); }
+async function afnRate() {
+  if (process.env.HESABPAY_RATE) { const v = +process.env.HESABPAY_RATE; if (v > 0) return v; }
+  try {
+    const r = await fetch('https://api.exchangerate-api.com/v4/latest/USD');
+    if (!r.ok) return HESABPAY_FALLBACK_RATE;
+    const j = await r.json();
+    const v = j && j.rates && +j.rates.AFN;
+    return (v > 0) ? v : HESABPAY_FALLBACK_RATE;
+  } catch (e) { return HESABPAY_FALLBACK_RATE; }
+}
+async function hesabpayCreateSession(payload) {
+  let r;
+  try {
+    r = await fetch(HESABPAY_BASE + '/api/v1/payment/create-session', {
+      method: 'POST',
+      headers: { Authorization: 'API-KEY ' + HESABPAY_KEY, 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    });
+  } catch (e) { throw new Error('hesabpay create-session failed: ' + e.message); }
+  if (!r.ok) { const t = await r.text().catch(() => ''); throw new Error('hesabpay create-session failed: HTTP ' + r.status + ' ' + t.slice(0, 200)); }
+  return r.json();
+}
+async function hesabpayVerifySignature(signature, timestamp) {
+  // Primary: the remote verify endpoint (XAbubakr plugin). If that call itself
+  // fails on the network, fall back to the local md5 check (habib-studio plugin:
+  // md5(api_key + timestamp)). A remote "not valid" answer is final — no fallback.
+  try {
+    const r = await fetch(HESABPAY_BASE + '/api/v1/hesab/webhooks/verify-signature', {
+      method: 'POST',
+      headers: { Authorization: 'API-KEY ' + HESABPAY_KEY, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ signature: String(signature), timestamp: String(timestamp) }),
+    });
+    if (!r.ok) return false;
+    const j = await r.json().catch(() => ({}));
+    return !!(j && j.success === true);
+  } catch (e) {
+    const expected = crypto.createHash('md5').update(HESABPAY_KEY + String(timestamp)).digest('hex');
+    try { return crypto.timingSafeEqual(Buffer.from(expected), Buffer.from(String(signature))); }
+    catch (e2) { return false; }
+  }
+}
+function grantGold(u) {
+  u.gold = true;
+  if (!u.me || typeof u.me !== 'object') u.me = {};
+  u.me.goldUntil = Date.now() + GOLD_DAYS * GOLD_DAY_MS;
+  save();
+}
 fs.mkdirSync(UPLOADS, { recursive: true });
 
 /* ---------- store ----------
@@ -42,7 +131,7 @@ fs.mkdirSync(UPLOADS, { recursive: true });
    events, kv. Nested data (profile, reacts, messages) is stored as jsonb,
    mirroring the JSON structure 1:1. OTP codes are NOT stored here in
    Supabase mode — they live in Supabase Auth (see sendOtpEmail). */
-let db = { seq: 1, users: {}, sessions: {}, matches: {}, reports: [], events: {} };
+let db = { seq: 1, users: {}, sessions: {}, matches: {}, reports: [], events: {}, goldOrders: {} };
 function loadJson() { try { db = Object.assign(db, JSON.parse(fs.readFileSync(DATA_FILE, 'utf8'))); } catch (e) { /* first run: keep empty db */ } }
 const otps = {}, hits = {};            // volatile (JSON mode OTPs + rate limits)
 
@@ -80,7 +169,7 @@ async function storeLoad() {               // Supabase -> in-memory db (throws o
   const [users, sessions, matches, reports, events, kv] = await Promise.all([
     sbSelect('users'), sbSelect('sessions'), sbSelect('matches'), sbSelect('reports'), sbSelect('events'), sbSelect('kv'),
   ]);
-  db = { seq: 1, users: {}, sessions: {}, matches: {}, reports: [], events: {} };
+  db = { seq: 1, users: {}, sessions: {}, matches: {}, reports: [], events: {}, goldOrders: {} };
   for (const r of users) db.users[r.id] = userFromRow(r);
   for (const r of sessions) db.sessions[r.token] = r.user_id;
   for (const r of matches) db.matches[r.match_key] = { t: r.t, msgs: r.msgs || [] };
@@ -89,13 +178,16 @@ async function storeLoad() {               // Supabase -> in-memory db (throws o
   const seqRow = kv.find(k => k.key === 'seq');
   if (seqRow) db.seq = +seqRow.value || (Math.max(0, ...Object.keys(db.users).map(Number)) + 1);
   else db.seq = Math.max(0, ...Object.keys(db.users).map(Number)) + 1;
+  const goRow = kv.find(k => k.key === 'gold_orders');
+  if (goRow && goRow.value) { try { db.goldOrders = (typeof goRow.value === 'string' ? JSON.parse(goRow.value) : goRow.value) || {}; } catch (e) { db.goldOrders = {}; } }
 }
 let lastSynced = null, persistRunning = false, persistQueued = false;
 async function persistOnce() {             // diff lastSynced snapshot -> Supabase
   const cur = JSON.stringify(db);
   if (cur === lastSynced) return;
-  const prev = lastSynced ? JSON.parse(lastSynced) : { seq: 1, users: {}, sessions: {}, matches: {}, reports: [], events: {} };
+  const prev = lastSynced ? JSON.parse(lastSynced) : { seq: 1, users: {}, sessions: {}, matches: {}, reports: [], events: {}, goldOrders: {} };
   if (prev.seq !== db.seq) await sbUpsert('kv', [{ key: 'seq', value: db.seq }], 'key');
+  if (JSON.stringify(prev.goldOrders || {}) !== JSON.stringify(db.goldOrders)) await sbUpsert('kv', [{ key: 'gold_orders', value: db.goldOrders }], 'key');
   const diffMap = async (prevObj, curObj, toRow, table, pkCol) => {
     const rows = [], dels = [];
     for (const k of new Set([...Object.keys(prevObj || {}), ...Object.keys(curObj || {})])) {
@@ -162,10 +254,10 @@ function publicProfile(u, viewer) {
   const me = u.me, unlocked = !!(viewer.unlocked && viewer.unlocked[u.id]);
   return { id: u.id, name: me.name, username: me.username || '', age: me.age, height: me.height || 0, country: me.country || '', state: me.state || '', city: me.city, job: me.job, edu: me.edu || '', marital: me.marital || '', children: me.children || '', smoke: me.smoke || '', drink: me.drink || '', g: me.g, intent: me.intent, prayer: me.prayer, langs: me.langs || '', about: me.about, q: [], int: me.int || [],
     nationality: me.nationality || '', grewUp: me.grewUp || '', sect: me.sect || '', ethnicity: me.ethnicity || '', marriagePlans: me.marriagePlans || '', relocationPlans: me.relocationPlans || '', familyPlans: me.familyPlans || '', dress: me.dress || '', diet: me.diet || '', faith: me.faith || [], personality: me.personality || [], polygamy: me.polygamy || '', parents: me.parents || '', top3: me.top3 || '',
-    joined: u.createdAt || 0, gold: !!u.gold, filters: me.myFilters || null,
+    joined: u.createdAt || 0, gold: isGold(u), filters: me.myFilters || null,
     ver: u.ver === 2, priv: !!me.blur, photos: (!me.blur || unlocked) ? (me.photos || []) : [], online: Date.now() - (u.seen || 0) < 120000 };
 }
-function ownMe(u) { return Object.assign({}, u.me, { id: u.id, ver: u.ver, gold: !!u.gold, wali: !!u.me.wali, waliCode: u.waliCode || '', done: true, joined: u.createdAt || 0 }); }
+function ownMe(u) { return Object.assign({}, u.me, { id: u.id, ver: u.ver, gold: isGold(u), wali: !!u.me.wali, waliCode: u.waliCode || '', done: true, joined: u.createdAt || 0 }); }
 function stateFor(u) {
   const matches = {}; for (const k of matchesOf(u.id)) { const m = db.matches[k], o = otherOf(k, u.id); matches[o] = { t: m.t, unread: m.msgs.filter(x => x.from !== u.id && !x.readAt).length, msgs: m.msgs.map(x => viewMsg(x, u.id)) }; }
   const acted = {}; for (const k in u.reacts) acted[k] = u.reacts[k];
@@ -307,7 +399,7 @@ route('PUT', '/api/me', {}, (c) => {
     faith: (Array.isArray(b.faith) ? b.faith : []).map(x => S(x, 30)).slice(0, 12), personality: (Array.isArray(b.personality) ? b.personality : []).map(x => S(x, 20)).slice(0, 12),
     polygamy: ['no', 'open', 'unsure'].includes(b.polygamy) ? b.polygamy : '', parents: S(b.parents, 80), top3: S(b.top3, 120),
     myFilters: (() => { const mf = b.myFilters; if (mf === undefined) return prev.myFilters || null; if (!mf || typeof mf !== 'object') return null; const pick = (src, keys) => { const o = {}; for (const k of keys) if (src[k] !== undefined) o[k] = src[k]; return o; }; return { f: pick(mf.f || {}, ['min', 'max', 'country', 'state', 'city', 'nationality', 'hmin', 'hmax', 'marital', 'children', 'grewUp', 'lang', 'edu', 'profession', 'int', 'marriagePlans', 'relocationPlans', 'familyPlans', 'prayer', 'dress', 'diet', 'smoke', 'drink', 'sect', 'ethnicity']), fg: pick(mf.fg || {}, ['liked', 'bio', 'online', 'goldMember', 'justJoined', 'priv', 'ver', 'born']), fmode: mf.fmode === 'gold' ? 'gold' : 'simple' }; })(),
-    blur: !!b.blur, wali: !!b.wali, womenFirst: !!b.womenFirst, incog: !!b.incog, dist: b.dist !== false, theme: ['dark', 'light'].includes(b.theme) ? b.theme : '', lang: b.lang === 'en' ? 'en' : 'ps', photos
+    goldUntil: prev.goldUntil || 0, blur: !!b.blur, wali: !!b.wali, womenFirst: !!b.womenFirst, incog: !!b.incog, dist: b.dist !== false, theme: ['dark', 'light'].includes(b.theme) ? b.theme : '', lang: b.lang === 'en' ? 'en' : 'ps', photos
   };
   save(); c.json(200, { me: ownMe(u) });
 });
@@ -370,7 +462,7 @@ route('POST', '/api/reset-history', {}, (c) => {
   const u = c.user; u.reacts = {}; u.hist = []; save(); c.json(200, { ok: true });
 });
 route('POST', '/api/undo', {}, (c) => {
-  const u = c.user; if (!u.gold) return c.err(403, 'not_gold');
+  const u = c.user; if (!isGold(u)) return c.err(403, 'not_gold');
   const id = u.hist.pop(); if (!id) return c.json(200, { id: 0 });
   delete u.reacts[id]; const k = mkey(u.id, id), m = db.matches[k]; if (m && !m.msgs.length) delete db.matches[k];
   save(); c.json(200, { id });
@@ -381,7 +473,7 @@ route('POST', '/api/messages', {}, (c) => {
   if (!m || !o || isBlocked(u.id, to)) return c.err(403, 'not_matched');
   if (!rate('msg:' + u.id, 60, 60000)) return c.err(429, 'rate_limited');
   const first = !m.msgs.some(x => x.from === u.id);
-  if (first && activeChats(u.id) >= (u.gold ? 10 : 5)) return c.err(403, 'chat_limit');
+  if (first && activeChats(u.id) >= (isGold(u) ? 10 : 5)) return c.err(403, 'chat_limit');
   if (first && o.me.g === 'f' && o.me.womenFirst && !m.msgs.some(x => x.from === to)) return c.err(403, 'women_first');
   const msg = { from: u.id, t: Date.now() };
   if (c.body.text) msg.text = S(c.body.text, 2000);
@@ -430,9 +522,54 @@ route('POST', '/api/wali/view', { anon: true }, (c) => {
   const conversations = matchesOf(u.id).map(k => { const o = db.users[otherOf(k, u.id)]; return { name: o && o.me ? o.me.name : '—', msgs: db.matches[k].msgs.map(m => viewMsg(m, u.id)) }; });
   c.json(200, { conversations });
 });
-route('POST', '/api/checkout', {}, (c) => {
+route('POST', '/api/checkout', {}, async (c) => {
   if (DEV_GOLD) { c.user.gold = true; save(); return c.json(200, { ok: true, trial: true }); }
-  c.json(200, { ok: false, error: 'billing_not_configured' });     // return { ok:false, url } to redirect to a hosted checkout
+  if (!HESABPAY_KEY) return c.json(200, { ok: false, error: 'billing_not_configured' });
+  if (!rate('checkout:' + c.user.id, 5, 3600000)) return c.err(429, 'rate_limited');
+  const u = c.user;
+  if (isGold(u)) return c.json(200, { ok: true, active: true });   // already Gold — nothing to buy
+  const afn = Math.max(1, Math.round(GOLD_PRICE_USD * await afnRate()));
+  const orderId = 'gold-' + u.id + '-' + crypto.randomBytes(4).toString('hex');
+  const email = (u.contact || '').indexOf('@') >= 0 ? u.contact : '';
+  const payload = {
+    order_id: orderId,
+    items: [{ id: orderId, product_id: 'hamdam-gold-1mo', name: 'Hamdam Gold — 1 month | Qty 1 Pcs', price: afn }],
+    email: email,
+    callback_url: PUBLIC_URL + '/api/hesabpay/webhook',
+    success_url: APP_URL + '/?gold=paid',
+    cancel_url: APP_URL + '/?gold=cancelled',
+  };
+  let res;
+  try { res = await hesabpayCreateSession(payload); } catch (e) { console.error('hesabpay create-session failed:', e.message); return c.err(500, 'server_error'); }
+  if (!res || typeof res.url !== 'string' || !res.url) return c.err(500, 'server_error');
+  db.goldOrders[orderId] = { uid: u.id, afn: afn, usd: GOLD_PRICE_USD, created: Date.now(), status: 'pending' };
+  save();
+  c.json(200, { ok: true, url: res.url, order: orderId, afn: afn });
+});
+route('POST', '/api/hesabpay/webhook', { anon: true }, async (c) => {
+  const d = (c.body && typeof c.body === 'object') ? c.body : {};
+  const statusCode = (d.status_code === undefined || d.status_code === null) ? null : parseInt(d.status_code, 10);
+  const signature = d.signature ? String(d.signature) : '';
+  const timestamp = d.timestamp ? String(d.timestamp) : '';
+  const txnId = d.transaction_id ? String(d.transaction_id) : '';
+  const success = d.success === true;
+  if (statusCode === null || !signature || !timestamp || !txnId) return c.json(400, { error: 'invalid_payload' });
+  if (!HESABPAY_KEY) return c.json(500, { error: 'billing_not_configured' });
+  let okSig = false;
+  try { okSig = await hesabpayVerifySignature(signature, timestamp); } catch (e) { console.error('hesabpay verify failed:', e.message); return c.json(500, { error: 'server_error' }); }
+  if (!okSig) return c.json(403, { error: 'invalid_signature' });
+  const orderId = d.order_id ? String(d.order_id) : (d.items && d.items[0] && d.items[0].id ? String(d.items[0].id) : '');
+  const order = orderId ? db.goldOrders[orderId] : null;
+  if (!order) return c.json(404, { error: 'order_not_found' });
+  if (order.status === 'paid') return c.json(200, { ok: true, already: true });   // idempotent: duplicate webhooks never re-grant
+  if (!(statusCode === 10 && success)) { order.status = 'failed'; save(); return c.json(200, { ok: true, paid: false }); }
+  const paidPrice = (d.items && d.items[0] && d.items[0].price !== undefined) ? +d.items[0].price : null;
+  if (paidPrice !== null && paidPrice !== order.afn) { order.status = 'amount_mismatch'; save(); return c.json(400, { error: 'amount_mismatch' }); }
+  const u = db.users[order.uid];
+  if (!u) return c.json(404, { error: 'user_not_found' });
+  grantGold(u);
+  order.status = 'paid'; order.txn = txnId; order.paidAt = Date.now(); save();
+  c.json(200, { ok: true, paid: true });
 });
 route('GET', '/api/health', { anon: true }, (c) => {
   c.json(200, { ok: true, store: USE_SB ? 'supabase' : 'json', time: Date.now() });
