@@ -7,12 +7,14 @@
    every change to the configured store (debounced, as before). Supabase is the
    durable source of truth in production; the JSON file is only a dev fallback.
    Run one instance only: the in-memory working set is not shared between
-   processes. Media files are stored on local disk (see README_DEPLOY.md —
-   on Render's free tier the disk is ephemeral; use Supabase Storage for
-   permanent media in a later step).
+   processes. Profile/chat photos live in Supabase Storage (bucket hamdam-photos,
+   public read; see supabase-storage-photos.sql). The client uploads
+   straight to Storage and registers the public URL via POST
+   /api/media-url; /media on local disk stays only as a fallback for
+   already-uploaded files and for voice audio (out of scope here).
 
    Run:  node server.js            (serves the app at http://localhost:8787)
-   Env:  PORT, PUBLIC_URL, DATA_FILE, ADMIN_KEY, ALLOW_ORIGIN,
+   Env:  PORT, PUBLIC_URL, DATA_FILE, ADMIN_KEY, ADMIN_EMAIL, ALLOW_ORIGIN,
          SUPABASE_URL, SUPABASE_ANON_KEY, SUPABASE_SERVICE_ROLE_KEY,
          DEV_OTP=1 (return the code in the response — local dev only, default off),
          DEV_GOLD=1 (trial gold without billing — dev only),
@@ -26,6 +28,7 @@ const PUBLIC_URL = (process.env.PUBLIC_URL || 'http://localhost:' + PORT).replac
 const DATA_FILE = process.env.DATA_FILE || path.join(__dirname, 'data', 'db.json');
 const UPLOADS = path.join(path.dirname(DATA_FILE), 'uploads');
 const ADMIN_KEY = process.env.ADMIN_KEY || '';
+const ADMIN_EMAIL = (process.env.ADMIN_EMAIL || '').trim().toLowerCase();
 const DEV_OTP = process.env.DEV_OTP === '1';   // OFF by default: codes are never returned or logged
 const DEV_GOLD = process.env.DEV_GOLD === '1';
 const SB_URL = (process.env.SUPABASE_URL || '').replace(/\/$/, '');
@@ -161,8 +164,8 @@ async function sbUpsert(table, rows, onConflict) {
 async function sbDelete(table, col, val) {
   await sbReq('DELETE', '/rest/v1/' + table + '?' + col + '=eq.' + encodeURIComponent(val), undefined, 'return=minimal');
 }
-const userToRow = u => ({ id: u.id, contact: u.contact, me: u.me || null, ver: u.ver || 0, gold: !!u.gold, wali_code: u.waliCode || '', blocked: u.blocked || {}, reacts: u.reacts || {}, hist: u.hist || [], unlocked: u.unlocked || {}, media: u.media || [], selfie: u.selfie || null, seen: u.seen || 0, created_at: u.createdAt || 0, compliments: u.compliments || {}, react_at: u.reactAt || {}, visits: u.visits || {} });
-const userFromRow = r => ({ id: r.id, contact: r.contact, me: r.me, ver: r.ver, gold: !!r.gold, waliCode: r.wali_code || '', blocked: r.blocked || {}, reacts: r.reacts || {}, hist: r.hist || [], unlocked: r.unlocked || {}, media: r.media || [], createdAt: r.created_at || 0, seen: r.seen || 0, selfie: r.selfie || undefined, compliments: r.compliments || {}, reactAt: r.react_at || {}, visits: r.visits || {} });
+const userToRow = u => ({ id: u.id, contact: u.contact, me: u.me || null, ver: u.ver || 0, gold: !!u.gold, blocked: u.blocked || {}, reacts: u.reacts || {}, hist: u.hist || [], unlocked: u.unlocked || {}, media: u.media || [], selfie: u.selfie || null, seen: u.seen || 0, created_at: u.createdAt || 0, compliments: u.compliments || {}, react_at: u.reactAt || {}, visits: u.visits || {} });
+const userFromRow = r => ({ id: r.id, contact: r.contact, me: r.me, ver: r.ver, gold: !!r.gold, blocked: r.blocked || {}, reacts: r.reacts || {}, hist: r.hist || [], unlocked: r.unlocked || {}, media: r.media || [], createdAt: r.created_at || 0, seen: r.seen || 0, selfie: r.selfie || undefined, compliments: r.compliments || {}, reactAt: r.react_at || {}, visits: r.visits || {} });
 const reportToRow = r => ({ id: r.id, t: r.t, by_user: r.by, about: r.about, reason: r.reason || '', context: r.context || [], status: r.status || 'open' });
 const reportFromRow = r => ({ id: r.id, t: r.t, by: r.by_user, about: r.about, reason: r.reason, context: r.context || [], status: r.status });
 async function storeLoad() {               // Supabase -> in-memory db (throws on failure)
@@ -250,14 +253,33 @@ function hasProfile(u) { return !!(u && u.me && u.me.name && u.me.age >= 18); }
 function matchesOf(uid) { return Object.keys(db.matches).filter(k => k.split('-').map(Number).includes(uid)); }
 function activeChats(uid) { return matchesOf(uid).filter(k => db.matches[k].msgs.some(m => m.from === uid)).length; }
 function viewMsg(m, uid) { const o = { f: m.from === uid ? 'me' : 'them', t: m.t }; if (m.text) o.text = m.text; if (m.img) o.img = m.img; if (m.audio) { o.audio = m.audio; o.dur = m.dur; } if (m.from === uid && m.readAt) o.read = true; return o; }
+function validLoc(lat, lng) { return typeof lat === 'number' && isFinite(lat) && typeof lng === 'number' && isFinite(lng) && lat >= -90 && lat <= 90 && lng >= -180 && lng <= 180; }
+function haversineKm(aLat, aLng, bLat, bLng) {
+  const R = 6371, rad = d => d * Math.PI / 180;
+  const dLa = rad(bLat - aLat), dLn = rad(bLng - aLng);
+  const h = Math.sin(dLa / 2) * Math.sin(dLa / 2) + Math.cos(rad(aLat)) * Math.cos(rad(bLat)) * Math.sin(dLn / 2) * Math.sin(dLn / 2);
+  return Math.round(2 * R * Math.asin(Math.sqrt(h)));
+}
+function parseLoc(b, prev) {
+  // Returns { lat, lng } to store. Explicit null clears; absent or invalid
+  // (out of range, non-numeric, or only one side given) keeps prev.
+  if (b.lat === null || b.lng === null) return { lat: null, lng: null };
+  if (b.lat === undefined || b.lng === undefined) return { lat: prev.lat, lng: prev.lng };
+  const la = +b.lat, ln = +b.lng;
+  if (!isFinite(la) || !isFinite(ln) || la < -90 || la > 90 || ln < -180 || ln > 180) return { lat: prev.lat, lng: prev.lng };
+  return { lat: la, lng: ln };
+}
+function activeTravel(me) { return (me && me.travel && me.travel.until > Date.now()) ? me.travel : null; }
 function publicProfile(u, viewer) {
   const me = u.me, unlocked = !!(viewer.unlocked && viewer.unlocked[u.id]);
-  return { id: u.id, name: me.name, username: me.username || '', age: me.age, height: me.height || 0, country: me.country || '', state: me.state || '', city: me.city, job: me.job, edu: me.edu || '', marital: me.marital || '', children: me.children || '', smoke: me.smoke || '', drink: me.drink || '', g: me.g, intent: me.intent, prayer: me.prayer, langs: me.langs || '', about: me.about, q: [], int: me.int || [],
+  const tr = activeTravel(me);
+  const dist = (viewer && viewer.me && validLoc(viewer.me.lat, viewer.me.lng) && validLoc(me.lat, me.lng)) ? haversineKm(viewer.me.lat, viewer.me.lng, me.lat, me.lng) : null;
+  return { id: u.id, name: me.name, username: me.username || '', age: me.age, height: me.height || 0, country: tr ? tr.country : (me.country || ''), state: tr ? (tr.state || me.state || '') : (me.state || ''), city: tr ? tr.city : me.city, job: me.job, edu: me.edu || '', marital: me.marital || '', children: me.children || '', smoke: me.smoke || '', drink: me.drink || '', g: me.g, intent: me.intent, prayer: me.prayer, langs: me.langs || '', about: me.about, q: me.q || [], int: me.int || [],
     nationality: me.nationality || '', grewUp: me.grewUp || '', sect: me.sect || '', ethnicity: me.ethnicity || '', marriagePlans: me.marriagePlans || '', relocationPlans: me.relocationPlans || '', familyPlans: me.familyPlans || '', dress: me.dress || '', diet: me.diet || '', faith: me.faith || [], personality: me.personality || [], polygamy: me.polygamy || '', parents: me.parents || '', top3: me.top3 || '',
-    joined: u.createdAt || 0, gold: isGold(u), filters: me.myFilters || null,
-    ver: u.ver === 2, priv: !!me.blur, photos: (!me.blur || unlocked) ? (me.photos || []) : [], online: Date.now() - (u.seen || 0) < 120000 };
+    joined: u.createdAt || 0, gold: isGold(u), filters: me.myFilters || null, seen: u.seen || 0, bornMuslim: (me.bornMuslim === true || me.bornMuslim === false) ? me.bornMuslim : null,
+    ver: u.ver === 2, priv: !!me.blur, photos: (!me.blur || unlocked) ? (me.photos || []) : [], dist: dist, online: Date.now() - (u.seen || 0) < 120000 };
 }
-function ownMe(u) { return Object.assign({}, u.me, { id: u.id, ver: u.ver, gold: isGold(u), wali: !!u.me.wali, waliCode: u.waliCode || '', done: true, joined: u.createdAt || 0 }); }
+function ownMe(u) { const o = Object.assign({}, u.me, { id: u.id, contact: u.contact, ver: u.ver, gold: isGold(u), done: true, joined: u.createdAt || 0 }); delete o.lat; delete o.lng; o.loc = validLoc(u.me.lat, u.me.lng); return o; }
 function stateFor(u) {
   const matches = {}; for (const k of matchesOf(u.id)) { const m = db.matches[k], o = otherOf(k, u.id); matches[o] = { t: m.t, unread: m.msgs.filter(x => x.from !== u.id && !x.readAt).length, msgs: m.msgs.map(x => viewMsg(x, u.id)) }; }
   const acted = {}; for (const k in u.reacts) acted[k] = u.reacts[k];
@@ -273,6 +295,24 @@ function saveDataUrl(dataUrl, maxBytes, allowed) {
   fs.writeFileSync(path.join(UPLOADS, name), buf); return name;
 }
 const mediaUrl = n => PUBLIC_URL + '/media/' + n;
+
+/* ---------- Supabase Storage photos (bucket: hamdam-photos, public read) ----------
+   Profile + chat photos are uploaded by the client straight to Storage
+   (PUT {SB_URL}/storage/v1/object/hamdam-photos/<name>, anon key) and then
+   registered here via POST /api/media-url, which records the public URL in
+   u.media so PUT /api/me and POST /api/messages accept it (both already
+   gate on u.media.includes(x) — no change needed there). The anon key is
+   public by design; the bucket policies govern access (see
+   supabase-storage-photos.sql). /media on local disk stays as a fallback
+   for already-uploaded files and for voice audio, which is out of scope. */
+const SB_BUCKET = 'hamdam-photos';
+const storagePublicPrefix = () => SB_URL + '/storage/v1/object/public/' + SB_BUCKET + '/';
+function isStoragePhotoUrl(x) {
+  if (typeof x !== 'string' || !SB_URL) return false;
+  if (!x.startsWith(storagePublicPrefix())) return false;
+  const rest = x.slice(storagePublicPrefix().length);
+  return rest.length > 0 && rest.length <= 200 && /^[A-Za-z0-9][A-Za-z0-9._\-\/]*$/.test(rest) && !rest.includes('..') && /\.(jpg|jpeg|png|webp)$/i.test(rest);
+}
 
 /* ---------- routes ---------- */
 const routes = [];
@@ -317,7 +357,7 @@ async function verifyOtpEmail(contact, code) {
    Google Client Secret is never used here — it lives only in Supabase. */
 function sessionForContact(contact) {
   let u = Object.values(db.users).find(x => x.contact === contact);
-  if (!u) { u = db.users[db.seq] = { id: db.seq++, contact, me: null, ver: 0, gold: false, waliCode: '', blocked: {}, reacts: {}, hist: [], unlocked: {}, media: [], createdAt: Date.now(), compliments: {}, reactAt: {}, visits: {} }; }
+  if (!u) { u = db.users[db.seq] = { id: db.seq++, contact, me: null, ver: 0, gold: false, blocked: {}, reacts: {}, hist: [], unlocked: {}, media: [], createdAt: Date.now(), compliments: {}, reactAt: {}, visits: {} }; }
   const token = crypto.randomBytes(32).toString('hex'); db.sessions[token] = u.id; save();
   return token;
 }
@@ -384,6 +424,20 @@ route('PUT', '/api/me', {}, (c) => {
   const b = c.body, u = c.user, age = Math.floor(+b.age);
   if (!(age >= 18 && age <= 90)) return c.err(400, 'age_invalid');
   const prev = u.me || {};
+  var travel = (prev.travel && typeof prev.travel === 'object') ? prev.travel : null;
+  if (b.travel !== undefined) {
+    if (b.travel === null) travel = null;
+    else if (b.travel && typeof b.travel === 'object') {
+      var tc = S(b.travel.city, 40), tco = S(b.travel.country, 40), tst = S(b.travel.state, 40), tu = +b.travel.until;
+      if (!isFinite(tu)) return c.err(400, 'travel_invalid');
+      if (tu <= Date.now()) travel = null;
+      else {
+        if (!tc || !tco || tu > Date.now() + 25 * 3600000) return c.err(400, 'travel_invalid');
+        travel = { city: tc, country: tco, state: tst, until: tu };
+      }
+    } else return c.err(400, 'travel_invalid');
+  }
+  const loc = parseLoc(b, prev);
   const photos = (Array.isArray(b.photos) ? b.photos : []).filter(x => u.media.includes(x)).slice(0, 3);
   u.me = {
     name: S(b.name, 24) || 'You', username: (b.username || '').toLowerCase().replace(/[^a-z0-9._-]/g, '').slice(0, 20), age, country: S(b.country, 40), state: S(b.state, 40), city: S(b.city, 40), job: S(b.job, 30), edu: S(b.edu, 40),
@@ -398,9 +452,12 @@ route('PUT', '/api/me', {}, (c) => {
     dress: S(b.dress, 20), diet: ['halal', 'veg', 'vegan', 'any'].includes(b.diet) ? b.diet : '',
     faith: (Array.isArray(b.faith) ? b.faith : []).map(x => S(x, 30)).slice(0, 12), personality: (Array.isArray(b.personality) ? b.personality : []).map(x => S(x, 20)).slice(0, 12),
     polygamy: ['no', 'open', 'unsure'].includes(b.polygamy) ? b.polygamy : '', parents: S(b.parents, 80), top3: S(b.top3, 120),
+    bornMuslim: b.bornMuslim === true ? true : b.bornMuslim === false ? false : (prev.bornMuslim === true || prev.bornMuslim === false ? prev.bornMuslim : null),
+    q: Array.isArray(b.q) ? b.q.filter(function (x) { return Array.isArray(x) && x[0] && x[1]; }).map(function (x) { return [S(x[0], 60), S(x[1], 120)]; }).filter(function (x) { return x[0] && x[1]; }).slice(0, 5) : (Array.isArray(prev.q) ? prev.q : []),
     myFilters: (() => { const mf = b.myFilters; if (mf === undefined) return prev.myFilters || null; if (!mf || typeof mf !== 'object') return null; const pick = (src, keys) => { const o = {}; for (const k of keys) if (src[k] !== undefined) o[k] = src[k]; return o; }; return { f: pick(mf.f || {}, ['min', 'max', 'country', 'state', 'city', 'nationality', 'hmin', 'hmax', 'marital', 'children', 'grewUp', 'lang', 'edu', 'profession', 'int', 'marriagePlans', 'relocationPlans', 'familyPlans', 'prayer', 'dress', 'diet', 'smoke', 'drink', 'sect', 'ethnicity']), fg: pick(mf.fg || {}, ['liked', 'bio', 'online', 'goldMember', 'justJoined', 'priv', 'ver', 'born']), fmode: mf.fmode === 'gold' ? 'gold' : 'simple' }; })(),
-    goldUntil: prev.goldUntil || 0, blur: !!b.blur, wali: !!b.wali, womenFirst: !!b.womenFirst, incog: !!b.incog, dist: b.dist !== false, theme: ['dark', 'light'].includes(b.theme) ? b.theme : '', lang: b.lang === 'en' ? 'en' : 'ps', photos
+    goldUntil: prev.goldUntil || 0, travel: travel, blur: !!b.blur, womenFirst: !!b.womenFirst, incog: !!b.incog, dist: b.dist !== false, theme: ['dark', 'light'].includes(b.theme) ? b.theme : '', lang: b.lang === 'en' ? 'en' : 'ps', photos
   };
+  if (loc.lat == null) { delete u.me.lat; delete u.me.lng; } else { u.me.lat = loc.lat; u.me.lng = loc.lng; }
   save(); c.json(200, { me: ownMe(u) });
 });
 route('DELETE', '/api/me', {}, (c) => {
@@ -483,6 +540,32 @@ route('POST', '/api/messages', {}, (c) => {
   m.msgs.push(msg); emit(to, { type: 'message', from: u.id, msg: viewMsg(msg, to) }); save();
   c.json(200, { msg: { t: msg.t } });
 });
+route('POST', '/api/typing', {}, (c) => {
+  const u = c.user, to = +c.body.to, o = db.users[to];
+  if (!o || !db.matches[mkey(u.id, to)] || isBlocked(u.id, to)) return c.json(200, { ok: true });
+  if (!rate('typing:' + u.id, 20, 60000)) return c.err(429, 'rate_limited');
+  emit(to, { type: 'typing', from: u.id });
+  c.json(200, { ok: true });
+});
+route('POST', '/api/call/signal', {}, (c) => {
+  const u = c.user, to = +c.body.to, kind = String(c.body.kind || '');
+  if (!['offer', 'answer', 'ice', 'end'].includes(kind)) return c.err(400, 'bad_kind');
+  const o = db.users[to];
+  if (!o || !db.matches[mkey(u.id, to)] || isBlocked(u.id, to)) return c.err(403, 'not_matched');
+  if (!rate('call:' + u.id, 120, 60000)) return c.err(429, 'rate_limited');
+  let payload = null;
+  if (kind === 'offer' || kind === 'answer') {
+    const p = c.body.payload || {};
+    if (typeof p !== 'object' || typeof p.sdp !== 'string' || !p.sdp) return c.err(400, 'bad_payload');
+    payload = { sdp: S(p.sdp, 8000), type: kind === 'offer' ? 'offer' : 'answer' };
+  } else if (kind === 'ice') {
+    const p = c.body.payload || {};
+    if (typeof p !== 'object' || typeof p.candidate !== 'string' || !p.candidate) return c.err(400, 'bad_payload');
+    payload = { candidate: S(p.candidate, 2000), sdpMid: S(p.sdpMid, 64), sdpMLineIndex: Math.max(0, Math.min(99, +p.sdpMLineIndex || 0)) };
+  }
+  emit(to, { type: 'call', from: u.id, kind, payload });
+  c.json(200, { ok: true });
+});
 route('POST', '/api/matches/:id/read', {}, (c) => {
   const u = c.user, id = +c.params.id, m = db.matches[mkey(u.id, id)]; if (!m) return c.json(200, { ok: true });
   let ch = false; m.msgs.forEach(x => { if (x.from !== u.id && !x.readAt) { x.readAt = Date.now(); ch = true; } });
@@ -494,6 +577,13 @@ route('POST', '/api/media', {}, (c) => {
   const name = saveDataUrl(c.body.dataUrl, photo ? 2e6 : 6e6, photo ? 'image/' : null); if (!name) return c.err(400, 'bad_media');
   const url = mediaUrl(name); c.user.media.push(url); save(); c.json(200, { url });
 });
+route('POST', '/api/media-url', {}, (c) => {
+  if (!rate('media-url:' + c.user.id, 60, 3600000)) return c.err(429, 'rate_limited');
+  const url = c.body.url;
+  if (!isStoragePhotoUrl(url)) return c.err(400, 'bad_media');
+  if (!c.user.media.includes(url)) c.user.media.push(url);
+  save(); c.json(200, { url });
+});
 
 route('POST', '/api/unmatch', {}, (c) => { delete db.matches[mkey(c.user.id, +c.body.id)]; save(); c.json(200, { ok: true }); });
 route('POST', '/api/block', {}, (c) => { const id = +c.body.id; if (db.users[id]) { c.user.blocked[id] = 1; delete db.matches[mkey(c.user.id, id)]; save(); } c.json(200, { ok: true }); });
@@ -504,6 +594,18 @@ route('POST', '/api/report', {}, (c) => {
   db.reports.push({ id: db.reports.length + 1, t: Date.now(), by: c.user.id, about: id, reason: S(c.body.reason, 80), context: m ? m.msgs.slice(-20) : [], status: 'open' });
   save(); c.json(200, { ok: true });
 });
+route('POST', '/api/report-problem', {}, (c) => {
+  const text = S(c.body.text, 1000);
+  if (!text) return c.err(400, 'empty');
+  if (!rate('report-problem:' + c.user.id, 5, 3600000)) return c.err(429, 'rate_limited');
+  const cat = ['login', 'profile', 'chat', 'gold', 'other'].includes(c.body.category) ? c.body.category : 'other';
+  // Problem report: no "about" user. reports.about is NOT NULL (see
+  // supabase-schema.sql), so store about: 0 and mark the reason; the
+  // category also rides in context for the admin page.
+  db.reports.push({ id: db.reports.length + 1, t: Date.now(), by: c.user.id, about: 0, reason: '[problem] [' + cat + '] ' + text, context: [{ type: 'problem', category: cat }], status: 'open' });
+  save(); c.json(200, { ok: true });
+});
+
 route('POST', '/api/photo-request', {}, (c) => {
   const u = c.user, id = +c.body.id;
   if (!db.matches[mkey(u.id, id)] || isBlocked(u.id, id)) return c.json(200, { status: 'requested' });   // only matches can unlock
@@ -513,14 +615,6 @@ route('POST', '/api/verify', {}, (c) => {
   const name = saveDataUrl(c.body.selfie, 4e6, 'image/'); if (!name) return c.err(400, 'bad_media');
   c.user.ver = 1; c.user.selfie = name; save(); emit(c.user.id, { type: 'verify', status: 'pending' });
   c.json(200, { status: 'pending' });
-});
-route('POST', '/api/wali/enable', {}, (c) => { const u = c.user; if (!u.waliCode) { u.waliCode = String(100000 + crypto.randomInt(900000)); save(); } c.json(200, { code: u.waliCode }); });
-route('POST', '/api/wali/view', { anon: true }, (c) => {
-  if (!rate('wali:' + c.ip, 8, 600000)) return c.err(429, 'rate_limited');
-  const code = S(c.body.code, 6), u = code && Object.values(db.users).find(x => x.waliCode === code && x.me && x.me.wali);
-  if (!u) return c.err(404, 'bad_code');
-  const conversations = matchesOf(u.id).map(k => { const o = db.users[otherOf(k, u.id)]; return { name: o && o.me ? o.me.name : '—', msgs: db.matches[k].msgs.map(m => viewMsg(m, u.id)) }; });
-  c.json(200, { conversations });
 });
 route('POST', '/api/checkout', {}, async (c) => {
   if (DEV_GOLD) { c.user.gold = true; save(); return c.json(200, { ok: true, trial: true }); }
@@ -571,6 +665,9 @@ route('POST', '/api/hesabpay/webhook', { anon: true }, async (c) => {
   order.status = 'paid'; order.txn = txnId; order.paidAt = Date.now(); save();
   c.json(200, { ok: true, paid: true });
 });
+route('GET', '/api/config', { anon: true }, (c) => {
+  c.json(200, { supabaseUrl: SB_URL, supabaseAnonKey: SB_ANON, storageBucket: SB_BUCKET, storageConfigured: !!(SB_URL && SB_ANON) });
+});
 route('GET', '/api/health', { anon: true }, (c) => {
   c.json(200, { ok: true, store: USE_SB ? 'supabase' : 'json', time: Date.now() });
 });
@@ -580,14 +677,32 @@ route('GET', '/api/events', {}, (c) => {
   c.json(200, { events: q.filter(e => e.id > after), cursor: q.length ? q[q.length - 1].id : after });
 });
 
-/* admin (X-Admin-Key) */
+/* admin (X-Admin-Key) — kept for API/script use */
 const admin = fn => (c) => (ADMIN_KEY && c.req.headers['x-admin-key'] === ADMIN_KEY) ? fn(c) : c.err(403, 'forbidden');
-route('GET', '/api/admin/reports', { anon: true }, admin(c => c.json(200, { reports: db.reports })));
-route('GET', '/api/admin/verifications', { anon: true }, admin(c => c.json(200, { pending: Object.values(db.users).filter(u => u.ver === 1).map(u => ({ id: u.id, name: u.me && u.me.name, selfie: u.selfie })) })));
+/* admin (session-based, ADMIN_EMAIL) — the app's Admin page. The client never
+   holds an admin key: the signed-in user's contact e-mail must equal
+   ADMIN_EMAIL (case-insensitive). If ADMIN_EMAIL is unset, nobody is admin. */
+const isAdminUser = u => !!(ADMIN_EMAIL && u && u.contact && String(u.contact).toLowerCase() === ADMIN_EMAIL);
+const requireAdmin = fn => (c) => isAdminUser(c.user) ? fn(c) : c.err(403, 'forbidden');
+const pendingVerifications = () => Object.values(db.users).filter(u => u.ver === 1).map(u => ({ id: u.id, name: u.me && u.me.name, selfie: u.selfie || null, selfieUrl: u.selfie ? mediaUrl(u.selfie) : null }));
+const decideVerification = (id, approve) => { const u = db.users[+id]; if (!u) return null; u.ver = approve ? 2 : 0; emit(u.id, { type: 'verify', status: approve ? 'approved' : 'rejected' }); save(); return u; };
+const listAdminUsers = () => Object.values(db.users).map(u => ({ id: u.id, name: u.me && u.me.name, contact: u.contact, age: u.me && u.me.age, gold: isGold(u), ver: u.ver, joined: u.createdAt || 0 }));
+const listAdminReports = () => db.reports;
+route('GET', '/api/admin/reports', { anon: true }, admin(c => c.json(200, { reports: listAdminReports() })));
+route('GET', '/api/admin/verifications', { anon: true }, admin(c => c.json(200, { pending: pendingVerifications() })));
 route('POST', '/api/admin/verify', { anon: true }, admin(c => {
-  const u = db.users[+c.body.id]; if (!u) return c.err(404, 'bad_code');
-  u.ver = c.body.approve ? 2 : 0; emit(u.id, { type: 'verify', status: c.body.approve ? 'approved' : 'rejected' }); save(); c.json(200, { ok: true });
+  if (!decideVerification(c.body.id, c.body.approve)) return c.err(404, 'bad_code');
+  c.json(200, { ok: true });
 }));
+/* session-based admin panel (auth required, ADMIN_EMAIL check server-side) */
+route('GET', '/api/admin/check', {}, (c) => c.json(200, { admin: isAdminUser(c.user) }));
+route('GET', '/api/admin/panel/verifications', {}, requireAdmin(c => c.json(200, { pending: pendingVerifications() })));
+route('POST', '/api/admin/panel/verify', {}, requireAdmin(c => {
+  if (!decideVerification(c.body.id, c.body.approve)) return c.err(404, 'bad_code');
+  c.json(200, { ok: true });
+}));
+route('GET', '/api/admin/panel/users', {}, requireAdmin(c => c.json(200, { users: listAdminUsers() })));
+route('GET', '/api/admin/panel/reports', {}, requireAdmin(c => c.json(200, { reports: listAdminReports() })));
 route('POST', '/api/admin/ban', { anon: true }, admin(c => {
   const id = +c.body.id; matchesOf(id).forEach(k => delete db.matches[k]); delete db.users[id];
   for (const t in db.sessions) if (db.sessions[t] === id) delete db.sessions[t]; save(); c.json(200, { ok: true });
