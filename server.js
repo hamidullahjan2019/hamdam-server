@@ -67,6 +67,7 @@ const USE_SB = !!(SB_URL && SB_SERVICE);       // Supabase store enabled only wh
 const GOLD_PRICE_USD = 5;
 const GOLD_DAYS = 30;
 const GOLD_PROMO_UNTIL = Date.parse('2027-01-01T00:00:00Z'); // Gold is FREE for everyone until 1 Jan 2027, then $5/month
+const GOLD_ENABLED = false; // Gold OFF by Hamid's order (2026-11-09) — set to true to re-enable Gold (promo + paid Gold)
 const GOLD_DAY_MS = 86400000;
 const HESABPAY_KEY = process.env.HESABPAY_API_KEY || '';
 const HESABPAY_LIVE = 'https://api.hesab.com';
@@ -74,20 +75,22 @@ const HESABPAY_SANDBOX = 'https://api-sandbox.hesab.com';
 const HESABPAY_BASE = process.env.HESABPAY_BASE_URL || (process.env.HESABPAY_ENV === 'sandbox' ? HESABPAY_SANDBOX : HESABPAY_LIVE);
 const HESABPAY_FALLBACK_RATE = 70;   // AFN per USD — used only if the live rate fetch fails
 const APP_URL = 'https://fastidious-pixie-4c8929.netlify.app';   // return URL host for Gold payments
-function isGold(u) { if (!u) return false; if (Date.now() < GOLD_PROMO_UNTIL) return true; return !!u.gold && !(u.me && u.me.goldUntil && u.me.goldUntil <= Date.now()); }
+function isGold(u) { if (!u) return false; if (!GOLD_ENABLED) return false; if (Date.now() < GOLD_PROMO_UNTIL) return true; return !!u.gold && !(u.me && u.me.goldUntil && u.me.goldUntil <= Date.now()); }
 function isBoosted(u) { return !!u && !!u.me && !!u.me.boostUntil && u.me.boostUntil > Date.now(); }
 
-/* ---------- free daily limits (batch 3, item 2) ----------
-   Free users: 10 likes (a super-like counts as a like) and 1 compliment
-   per day. When an allowance runs out it refills 12h after running out.
-   Gold users (effective gold via isGold, so expired Gold counts as free)
-   are unlimited and never consume. Stored in u.me.limits, inside the me
-   JSONB like goldUntil, so it survives restarts in both Supabase mode
-   (the existing me column - no schema change) and JSON-file mode;
-   PUT /api/me preserves it like goldUntil. */
+/* ---------- like limits (Hamid's rules, 2026-11-09) ----------
+   Gold users: 30 likes; free users: 10 likes (a super-like counts as a
+   like). When an allowance runs out it refills 10h after running out.
+   Compliments: free users 1/day, Gold users unlimited. Stored in
+   u.me.limits, inside the me JSONB like goldUntil, so it survives
+   restarts in both Supabase mode (the existing me column - no schema
+   change) and JSON-file mode; PUT /api/me preserves it like goldUntil.
+   Gold is OFF while GOLD_ENABLED is false (Hamid's order 2026-11-09) —
+   then everyone is a free user (10 likes, 10h refill). */
 const LIMITS_LIKES_PER_DAY = 10;
+const LIMITS_LIKES_PER_DAY_GOLD = 30;
 const LIMITS_COMPLIMENTS_PER_DAY = 1;
-const LIMITS_REFILL_MS = 12 * 3600000;
+const LIMITS_REFILL_MS = 10 * 3600000;
 function normLimits(raw) {
   const r = (raw && typeof raw === 'object') ? raw : {};
   const n = v => (Number.isFinite(+v) && +v > 0) ? Math.floor(+v) : 0;
@@ -100,23 +103,25 @@ function limitsView(u) {
   const likesResetAt = (l.likesResetAt && now > l.likesResetAt) ? 0 : l.likesResetAt;
   const complimentsUsed = (l.complimentsResetAt && now > l.complimentsResetAt) ? 0 : l.complimentsUsed;
   const complimentsResetAt = (l.complimentsResetAt && now > l.complimentsResetAt) ? 0 : l.complimentsResetAt;
-  return { likesUsed, likesLeft: Math.max(0, LIMITS_LIKES_PER_DAY - likesUsed), likesResetAt, complimentsUsed, complimentsLeft: Math.max(0, LIMITS_COMPLIMENTS_PER_DAY - complimentsUsed), complimentsResetAt };
+  const cap = isGold(u) ? LIMITS_LIKES_PER_DAY_GOLD : LIMITS_LIKES_PER_DAY;
+  return { likesUsed, likesLeft: Math.max(0, cap - likesUsed), likesResetAt, complimentsUsed, complimentsLeft: Math.max(0, LIMITS_COMPLIMENTS_PER_DAY - complimentsUsed), complimentsResetAt };
 }
 // Returns null when the react may proceed (allowance consumed), or
-// { kind: 'likes'|'compliments', resetAt } when a free user is past it.
-// A like/super-like consumes the like allowance; a react carrying a
-// compliment also consumes the compliment allowance.
+// { kind: 'likes'|'compliments', resetAt } when the user is past it.
+// A like/super-like consumes the like allowance (Gold 30, free 10);
+// a react carrying a compliment also consumes the compliment
+// allowance (free 1/day; Gold unlimited).
 function consumeLimits(u, countsLike, countsCompliment) {
-  if (isGold(u)) return null;
   if (!u.me || typeof u.me !== 'object') u.me = {};
   const l = normLimits(u.me.limits), now = Date.now();
   if (l.likesResetAt && now > l.likesResetAt) { l.likesUsed = 0; l.likesResetAt = 0; }
   if (l.complimentsResetAt && now > l.complimentsResetAt) { l.complimentsUsed = 0; l.complimentsResetAt = 0; }
   u.me.limits = l;
-  if (countsLike && l.likesUsed >= LIMITS_LIKES_PER_DAY) return { kind: 'likes', resetAt: l.likesResetAt || now + LIMITS_REFILL_MS };
-  if (countsCompliment && l.complimentsUsed >= LIMITS_COMPLIMENTS_PER_DAY) return { kind: 'compliments', resetAt: l.complimentsResetAt || now + LIMITS_REFILL_MS };
-  if (countsLike) { l.likesUsed += 1; if (l.likesUsed >= LIMITS_LIKES_PER_DAY) l.likesResetAt = now + LIMITS_REFILL_MS; }
-  if (countsCompliment) { l.complimentsUsed += 1; if (l.complimentsUsed >= LIMITS_COMPLIMENTS_PER_DAY) l.complimentsResetAt = now + LIMITS_REFILL_MS; }
+  const gold = isGold(u), cap = gold ? LIMITS_LIKES_PER_DAY_GOLD : LIMITS_LIKES_PER_DAY;
+  if (countsLike && l.likesUsed >= cap) return { kind: 'likes', resetAt: l.likesResetAt || now + LIMITS_REFILL_MS };
+  if (!gold && countsCompliment && l.complimentsUsed >= LIMITS_COMPLIMENTS_PER_DAY) return { kind: 'compliments', resetAt: l.complimentsResetAt || now + LIMITS_REFILL_MS };
+  if (countsLike) { l.likesUsed += 1; if (l.likesUsed >= cap) l.likesResetAt = now + LIMITS_REFILL_MS; }
+  if (!gold && countsCompliment) { l.complimentsUsed += 1; if (l.complimentsUsed >= LIMITS_COMPLIMENTS_PER_DAY) l.complimentsResetAt = now + LIMITS_REFILL_MS; }
   return null;
 }
 async function afnRate() {
@@ -329,7 +334,7 @@ function publicProfile(u, viewer) {
     joined: u.createdAt || 0, gold: isGold(u), filters: (viewer && isGold(viewer)) ? (me.myFilters || null) : null, seen: u.seen || 0, bornMuslim: (me.bornMuslim === true || me.bornMuslim === false) ? me.bornMuslim : null,
     ver: u.ver === 2, priv: !!me.blur, photos: (!me.blur || unlocked) ? (me.photos || []) : [], dist: dist, online: Date.now() - (u.seen || 0) < 120000, boosted: isBoosted(u) };
 }
-function ownMe(u) { const o = Object.assign({}, u.me, { id: u.id, contact: u.contact, ver: u.ver, gold: isGold(u), done: true, joined: u.createdAt || 0 }); delete o.lat; delete o.lng; o.loc = validLoc(u.me.lat, u.me.lng); o.limits = limitsView(u); const promo = Date.now() < GOLD_PROMO_UNTIL, realGold = !!u.gold && !(u.me && u.me.goldUntil && u.me.goldUntil <= Date.now()); o.goldPromo = promo && !realGold; if (promo && !realGold) o.goldUntil = GOLD_PROMO_UNTIL; return o; }
+function ownMe(u) { const o = Object.assign({}, u.me, { id: u.id, contact: u.contact, ver: u.ver, gold: isGold(u), done: true, joined: u.createdAt || 0 }); delete o.lat; delete o.lng; o.loc = validLoc(u.me.lat, u.me.lng); o.limits = limitsView(u); const promo = GOLD_ENABLED && Date.now() < GOLD_PROMO_UNTIL, realGold = !!u.gold && !(u.me && u.me.goldUntil && u.me.goldUntil <= Date.now()); o.goldPromo = promo && !realGold; if (promo && !realGold) o.goldUntil = GOLD_PROMO_UNTIL; o.goldEnabled = GOLD_ENABLED; return o; }
 function stateFor(u) {
   const matches = {}; for (const k of matchesOf(u.id)) { const m = db.matches[k], o = otherOf(k, u.id); matches[o] = { t: m.t, unread: m.msgs.filter(x => x.from !== u.id && !x.readAt).length, msgs: m.msgs.map(x => viewMsg(x, u.id)) }; }
   const acted = {}; for (const k in u.reacts) acted[k] = u.reacts[k];
@@ -762,7 +767,7 @@ route('POST', '/api/hesabpay/webhook', { anon: true }, async (c) => {
   c.json(200, { ok: true, paid: true });
 });
 route('GET', '/api/config', { anon: true }, (c) => {
-  c.json(200, { supabaseUrl: SB_URL, supabaseAnonKey: SB_ANON, storageBucket: SB_BUCKET, videoBucket: VIDEO_BUCKET, storageConfigured: !!(SB_URL && SB_ANON) });
+  c.json(200, { supabaseUrl: SB_URL, supabaseAnonKey: SB_ANON, storageBucket: SB_BUCKET, videoBucket: VIDEO_BUCKET, storageConfigured: !!(SB_URL && SB_ANON), goldEnabled: GOLD_ENABLED });
 });
 route('GET', '/api/health', { anon: true }, (c) => {
   c.json(200, { ok: true, store: USE_SB ? 'supabase' : 'json', time: Date.now() });
