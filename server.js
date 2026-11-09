@@ -74,6 +74,49 @@ const HESABPAY_BASE = process.env.HESABPAY_BASE_URL || (process.env.HESABPAY_ENV
 const HESABPAY_FALLBACK_RATE = 70;   // AFN per USD — used only if the live rate fetch fails
 const APP_URL = 'https://fastidious-pixie-4c8929.netlify.app';   // return URL host for Gold payments
 function isGold(u) { return !!u && !!u.gold && !(u.me && u.me.goldUntil && u.me.goldUntil <= Date.now()); }
+
+/* ---------- free daily limits (batch 3, item 2) ----------
+   Free users: 10 likes (a super-like counts as a like) and 1 compliment
+   per day. When an allowance runs out it refills 12h after running out.
+   Gold users (effective gold via isGold, so expired Gold counts as free)
+   are unlimited and never consume. Stored in u.me.limits, inside the me
+   JSONB like goldUntil, so it survives restarts in both Supabase mode
+   (the existing me column - no schema change) and JSON-file mode;
+   PUT /api/me preserves it like goldUntil. */
+const LIMITS_LIKES_PER_DAY = 10;
+const LIMITS_COMPLIMENTS_PER_DAY = 1;
+const LIMITS_REFILL_MS = 12 * 3600000;
+function normLimits(raw) {
+  const r = (raw && typeof raw === 'object') ? raw : {};
+  const n = v => (Number.isFinite(+v) && +v > 0) ? Math.floor(+v) : 0;
+  return { likesUsed: n(r.likesUsed), likesResetAt: n(r.likesResetAt), complimentsUsed: n(r.complimentsUsed), complimentsResetAt: n(r.complimentsResetAt) };
+}
+function limitsOf(u) { return normLimits(u && u.me && u.me.limits); }
+function limitsView(u) {
+  const l = limitsOf(u), now = Date.now();
+  const likesUsed = (l.likesResetAt && now > l.likesResetAt) ? 0 : l.likesUsed;
+  const likesResetAt = (l.likesResetAt && now > l.likesResetAt) ? 0 : l.likesResetAt;
+  const complimentsUsed = (l.complimentsResetAt && now > l.complimentsResetAt) ? 0 : l.complimentsUsed;
+  const complimentsResetAt = (l.complimentsResetAt && now > l.complimentsResetAt) ? 0 : l.complimentsResetAt;
+  return { likesUsed, likesLeft: Math.max(0, LIMITS_LIKES_PER_DAY - likesUsed), likesResetAt, complimentsUsed, complimentsLeft: Math.max(0, LIMITS_COMPLIMENTS_PER_DAY - complimentsUsed), complimentsResetAt };
+}
+// Returns null when the react may proceed (allowance consumed), or
+// { kind: 'likes'|'compliments', resetAt } when a free user is past it.
+// A like/super-like consumes the like allowance; a react carrying a
+// compliment also consumes the compliment allowance.
+function consumeLimits(u, countsLike, countsCompliment) {
+  if (isGold(u)) return null;
+  if (!u.me || typeof u.me !== 'object') u.me = {};
+  const l = normLimits(u.me.limits), now = Date.now();
+  if (l.likesResetAt && now > l.likesResetAt) { l.likesUsed = 0; l.likesResetAt = 0; }
+  if (l.complimentsResetAt && now > l.complimentsResetAt) { l.complimentsUsed = 0; l.complimentsResetAt = 0; }
+  u.me.limits = l;
+  if (countsLike && l.likesUsed >= LIMITS_LIKES_PER_DAY) return { kind: 'likes', resetAt: l.likesResetAt || now + LIMITS_REFILL_MS };
+  if (countsCompliment && l.complimentsUsed >= LIMITS_COMPLIMENTS_PER_DAY) return { kind: 'compliments', resetAt: l.complimentsResetAt || now + LIMITS_REFILL_MS };
+  if (countsLike) { l.likesUsed += 1; if (l.likesUsed >= LIMITS_LIKES_PER_DAY) l.likesResetAt = now + LIMITS_REFILL_MS; }
+  if (countsCompliment) { l.complimentsUsed += 1; if (l.complimentsUsed >= LIMITS_COMPLIMENTS_PER_DAY) l.complimentsResetAt = now + LIMITS_REFILL_MS; }
+  return null;
+}
 async function afnRate() {
   if (process.env.HESABPAY_RATE) { const v = +process.env.HESABPAY_RATE; if (v > 0) return v; }
   try {
@@ -279,11 +322,11 @@ function publicProfile(u, viewer) {
     joined: u.createdAt || 0, gold: isGold(u), filters: me.myFilters || null, seen: u.seen || 0, bornMuslim: (me.bornMuslim === true || me.bornMuslim === false) ? me.bornMuslim : null,
     ver: u.ver === 2, priv: !!me.blur, photos: (!me.blur || unlocked) ? (me.photos || []) : [], dist: dist, online: Date.now() - (u.seen || 0) < 120000 };
 }
-function ownMe(u) { const o = Object.assign({}, u.me, { id: u.id, contact: u.contact, ver: u.ver, gold: isGold(u), done: true, joined: u.createdAt || 0 }); delete o.lat; delete o.lng; o.loc = validLoc(u.me.lat, u.me.lng); return o; }
+function ownMe(u) { const o = Object.assign({}, u.me, { id: u.id, contact: u.contact, ver: u.ver, gold: isGold(u), done: true, joined: u.createdAt || 0 }); delete o.lat; delete o.lng; o.loc = validLoc(u.me.lat, u.me.lng); o.limits = limitsView(u); return o; }
 function stateFor(u) {
   const matches = {}; for (const k of matchesOf(u.id)) { const m = db.matches[k], o = otherOf(k, u.id); matches[o] = { t: m.t, unread: m.msgs.filter(x => x.from !== u.id && !x.readAt).length, msgs: m.msgs.map(x => viewMsg(x, u.id)) }; }
   const acted = {}; for (const k in u.reacts) acted[k] = u.reacts[k];
-  return { matches, blocked: u.blocked, acted, unlocked: u.unlocked || {}, notifs: [] };
+  return { matches, blocked: u.blocked, acted, unlocked: u.unlocked || {}, notifs: [], limits: limitsView(u) };
 }
 const MEDIA_EXT = { 'image/jpeg': 'jpg', 'image/png': 'png', 'audio/webm': 'webm', 'audio/ogg': 'ogg', 'audio/mp4': 'm4a', 'audio/mpeg': 'mp3', 'audio/wav': 'wav' };
 const EXT_TYPE = { jpg: 'image/jpeg', png: 'image/png', webm: 'audio/webm', ogg: 'audio/ogg', m4a: 'audio/mp4', mp3: 'audio/mpeg', wav: 'audio/wav' };
@@ -455,7 +498,7 @@ route('PUT', '/api/me', {}, (c) => {
     bornMuslim: b.bornMuslim === true ? true : b.bornMuslim === false ? false : (prev.bornMuslim === true || prev.bornMuslim === false ? prev.bornMuslim : null),
     q: Array.isArray(b.q) ? b.q.filter(function (x) { return Array.isArray(x) && x[0] && x[1]; }).map(function (x) { return [S(x[0], 60), S(x[1], 120)]; }).filter(function (x) { return x[0] && x[1]; }).slice(0, 5) : (Array.isArray(prev.q) ? prev.q : []),
     myFilters: (() => { const mf = b.myFilters; if (mf === undefined) return prev.myFilters || null; if (!mf || typeof mf !== 'object') return null; const pick = (src, keys) => { const o = {}; for (const k of keys) if (src[k] !== undefined) o[k] = src[k]; return o; }; return { f: pick(mf.f || {}, ['min', 'max', 'country', 'state', 'city', 'nationality', 'hmin', 'hmax', 'marital', 'children', 'grewUp', 'lang', 'edu', 'profession', 'int', 'marriagePlans', 'relocationPlans', 'familyPlans', 'prayer', 'dress', 'diet', 'smoke', 'drink', 'sect', 'ethnicity']), fg: pick(mf.fg || {}, ['liked', 'bio', 'online', 'goldMember', 'justJoined', 'priv', 'ver', 'born']), fmode: mf.fmode === 'gold' ? 'gold' : 'simple' }; })(),
-    goldUntil: prev.goldUntil || 0, travel: travel, blur: !!b.blur, womenFirst: !!b.womenFirst, incog: !!b.incog, dist: b.dist !== false, theme: ['dark', 'light'].includes(b.theme) ? b.theme : '', lang: b.lang === 'en' ? 'en' : 'ps', photos
+    goldUntil: prev.goldUntil || 0, limits: normLimits(prev.limits), travel: travel, blur: !!b.blur, womenFirst: !!b.womenFirst, incog: !!b.incog, dist: b.dist !== false, theme: ['dark', 'light'].includes(b.theme) ? b.theme : '', lang: b.lang === 'en' ? 'en' : 'ps', photos
   };
   if (loc.lat == null) { delete u.me.lat; delete u.me.lng; } else { u.me.lat = loc.lat; u.me.lng = loc.lng; }
   save(); c.json(200, { me: ownMe(u) });
@@ -489,6 +532,8 @@ route('POST', '/api/react', {}, (c) => {
   if (!['like', 'pass', 'super'].includes(kind) || !hasProfile(o) || o.id === u.id || o.me.g === u.me.g || isBlocked(u.id, id)) return c.err(400, 'blocked');
   if (!rate('react:' + u.id, 300, 3600000)) return c.err(429, 'rate_limited');
   const compliment = S(c.body.compliment, 120);
+  const limitBlock = consumeLimits(u, kind !== 'pass', !!(compliment && kind !== 'pass'));
+  if (limitBlock) return c.json(403, { error: 'limit_reached', kind: limitBlock.kind, resetAt: limitBlock.resetAt });
   u.reacts[id] = kind; u.hist.push(id); u.reactAt = u.reactAt || {}; u.reactAt[id] = Date.now();
   if (compliment && kind !== 'pass') { u.compliments = u.compliments || {}; u.compliments[id] = { text: compliment, t: Date.now() }; }
   let match = false, matchMsgs = null;
@@ -503,7 +548,7 @@ route('POST', '/api/react', {}, (c) => {
       emit(id, { type: 'like', id: u.id });
     }
   }
-  save(); c.json(200, { match, msgs: matchMsgs });
+  save(); c.json(200, { match, msgs: matchMsgs, limits: limitsView(u) });
 });
 route('POST', '/api/visit', {}, (c) => {
   const u = c.user, id = +c.body.id, o = db.users[id];
