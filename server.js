@@ -74,6 +74,7 @@ const HESABPAY_BASE = process.env.HESABPAY_BASE_URL || (process.env.HESABPAY_ENV
 const HESABPAY_FALLBACK_RATE = 70;   // AFN per USD — used only if the live rate fetch fails
 const APP_URL = 'https://fastidious-pixie-4c8929.netlify.app';   // return URL host for Gold payments
 function isGold(u) { return !!u && !!u.gold && !(u.me && u.me.goldUntil && u.me.goldUntil <= Date.now()); }
+function isBoosted(u) { return !!u && !!u.me && !!u.me.boostUntil && u.me.boostUntil > Date.now(); }
 
 /* ---------- free daily limits (batch 3, item 2) ----------
    Free users: 10 likes (a super-like counts as a like) and 1 compliment
@@ -290,9 +291,9 @@ if (process.env.ALLOW_ORIGIN) cors = { 'Access-Control-Allow-Origin': process.en
 const S = (v, n) => String(v == null ? '' : v).trim().slice(0, n);
 const mkey = (a, b) => a < b ? a + '-' + b : b + '-' + a;
 const otherOf = (k, me) => { const [a, b] = k.split('-').map(Number); return a === me ? b : a; };
-function emit(uid, ev) { const q = db.events[uid] || (db.events[uid] = []); const id = (q.length ? q[q.length - 1].id : 0) + 1; q.push(Object.assign({ id, t: Date.now() }, ev)); if (q.length > 500) q.splice(0, q.length - 500); }
+function emit(uid, ev) { const q = db.events[uid] || (db.events[uid] = []); const id = (q.length ? q[q.length - 1].id : 0) + 1; q.push(Object.assign({}, ev, { id, t: Date.now() })); if (q.length > 500) q.splice(0, q.length - 500); }
 function isBlocked(a, b) { const A = db.users[a], B = db.users[b]; return !!((A && A.blocked[b]) || (B && B.blocked[a])); }
-function hasProfile(u) { return !!(u && u.me && u.me.name && u.me.age >= 18); }
+function hasProfile(u) { return !!(u && u.me && u.me.name && u.me.age >= 18 && u.me.photos && u.me.photos.length > 0); }
 function matchesOf(uid) { return Object.keys(db.matches).filter(k => k.split('-').map(Number).includes(uid)); }
 function activeChats(uid) { return matchesOf(uid).filter(k => db.matches[k].msgs.some(m => m.from === uid)).length; }
 function viewMsg(m, uid) { const o = { f: m.from === uid ? 'me' : 'them', t: m.t }; if (m.text) o.text = m.text; if (m.img) o.img = m.img; if (m.audio) { o.audio = m.audio; o.dur = m.dur; } if (m.from === uid && m.readAt) o.read = true; return o; }
@@ -316,17 +317,18 @@ function activeTravel(me) { return (me && me.travel && me.travel.until > Date.no
 function publicProfile(u, viewer) {
   const me = u.me, unlocked = !!(viewer.unlocked && viewer.unlocked[u.id]);
   const tr = activeTravel(me);
-  const dist = (viewer && viewer.me && validLoc(viewer.me.lat, viewer.me.lng) && validLoc(me.lat, me.lng)) ? haversineKm(viewer.me.lat, viewer.me.lng, me.lat, me.lng) : null;
+  const dist = (!tr && me.dist !== false && viewer && viewer.me && validLoc(viewer.me.lat, viewer.me.lng) && validLoc(me.lat, me.lng)) ? haversineKm(viewer.me.lat, viewer.me.lng, me.lat, me.lng) : null;
   return { id: u.id, name: me.name, username: me.username || '', age: me.age, height: me.height || 0, country: tr ? tr.country : (me.country || ''), state: tr ? (tr.state || me.state || '') : (me.state || ''), city: tr ? tr.city : me.city, job: me.job, edu: me.edu || '', marital: me.marital || '', children: me.children || '', smoke: me.smoke || '', drink: me.drink || '', g: me.g, intent: me.intent, prayer: me.prayer, langs: me.langs || '', about: me.about, q: me.q || [], int: me.int || [],
     nationality: me.nationality || '', grewUp: me.grewUp || '', sect: me.sect || '', ethnicity: me.ethnicity || '', marriagePlans: me.marriagePlans || '', relocationPlans: me.relocationPlans || '', familyPlans: me.familyPlans || '', dress: me.dress || '', diet: me.diet || '', faith: me.faith || [], personality: me.personality || [], polygamy: me.polygamy || '', parents: me.parents || '', top3: me.top3 || '',
-    joined: u.createdAt || 0, gold: isGold(u), filters: me.myFilters || null, seen: u.seen || 0, bornMuslim: (me.bornMuslim === true || me.bornMuslim === false) ? me.bornMuslim : null,
-    ver: u.ver === 2, priv: !!me.blur, photos: (!me.blur || unlocked) ? (me.photos || []) : [], dist: dist, online: Date.now() - (u.seen || 0) < 120000 };
+    joined: u.createdAt || 0, gold: isGold(u), filters: (viewer && isGold(viewer)) ? (me.myFilters || null) : null, seen: u.seen || 0, bornMuslim: (me.bornMuslim === true || me.bornMuslim === false) ? me.bornMuslim : null,
+    ver: u.ver === 2, priv: !!me.blur, photos: (!me.blur || unlocked) ? (me.photos || []) : [], dist: dist, online: Date.now() - (u.seen || 0) < 120000, boosted: isBoosted(u) };
 }
 function ownMe(u) { const o = Object.assign({}, u.me, { id: u.id, contact: u.contact, ver: u.ver, gold: isGold(u), done: true, joined: u.createdAt || 0 }); delete o.lat; delete o.lng; o.loc = validLoc(u.me.lat, u.me.lng); o.limits = limitsView(u); return o; }
 function stateFor(u) {
   const matches = {}; for (const k of matchesOf(u.id)) { const m = db.matches[k], o = otherOf(k, u.id); matches[o] = { t: m.t, unread: m.msgs.filter(x => x.from !== u.id && !x.readAt).length, msgs: m.msgs.map(x => viewMsg(x, u.id)) }; }
   const acted = {}; for (const k in u.reacts) acted[k] = u.reacts[k];
-  return { matches, blocked: u.blocked, acted, unlocked: u.unlocked || {}, notifs: [], limits: limitsView(u) };
+  const blockedUsers = Object.keys(u.blocked || {}).map(k => { const b = db.users[+k]; return b ? { id: b.id, name: (b.me && b.me.name) || '' } : null; }).filter(Boolean);
+  return { matches, blocked: u.blocked, blockedUsers, acted, unlocked: u.unlocked || {}, notifs: [], limits: limitsView(u) };
 }
 const MEDIA_EXT = { 'image/jpeg': 'jpg', 'image/png': 'png', 'audio/webm': 'webm', 'audio/ogg': 'ogg', 'audio/mp4': 'm4a', 'audio/mpeg': 'mp3', 'audio/wav': 'wav' };
 const EXT_TYPE = { jpg: 'image/jpeg', png: 'image/png', webm: 'audio/webm', ogg: 'audio/ogg', m4a: 'audio/mp4', mp3: 'audio/mpeg', wav: 'audio/wav' };
@@ -372,6 +374,7 @@ async function sendOtpEmail(contact) {
   let r;
   try {
     r = await fetch(SB_URL + '/auth/v1/otp', {
+      signal: AbortSignal.timeout(15000),
       method: 'POST',
       headers: { apikey: SB_ANON, 'Content-Type': 'application/json' },
       body: JSON.stringify({ email: contact, create_user: true }),
@@ -383,6 +386,7 @@ async function verifyOtpEmail(contact, code) {
   let r;
   try {
     r = await fetch(SB_URL + '/auth/v1/verify', {
+      signal: AbortSignal.timeout(15000),
       method: 'POST',
       headers: { apikey: SB_ANON, 'Content-Type': 'application/json' },
       body: JSON.stringify({ email: contact, token: code, type: 'email' }),
@@ -408,6 +412,7 @@ async function supabaseUserByToken(token) {
   let r;
   try {
     r = await fetch(SB_URL + '/auth/v1/user', {
+      signal: AbortSignal.timeout(15000),
       method: 'GET',
       headers: { apikey: SB_ANON, Authorization: 'Bearer ' + token },
     });
@@ -482,8 +487,11 @@ route('PUT', '/api/me', {}, (c) => {
   }
   const loc = parseLoc(b, prev);
   const photos = (Array.isArray(b.photos) ? b.photos : []).filter(x => u.media.includes(x)).slice(0, 3);
+  const username = (b.username || '').toLowerCase().replace(/[^a-z0-9._-]/g, '').slice(0, 20);
+  if (username && !/[a-z0-9]/.test(username)) return c.err(400, 'bad_username'); // a username needs at least one letter or number
+  if (username && username !== (prev.username || '') && Object.values(db.users).some(x => x.id !== u.id && x.me && x.me.username === username)) return c.err(400, 'username_taken');
   u.me = {
-    name: S(b.name, 24) || 'You', username: (b.username || '').toLowerCase().replace(/[^a-z0-9._-]/g, '').slice(0, 20), age, country: S(b.country, 40), state: S(b.state, 40), city: S(b.city, 40), job: S(b.job, 30), edu: S(b.edu, 40),
+    name: S(b.name, 24) || 'You', username: username, age, country: S(b.country, 40), state: S(b.state, 40), city: S(b.city, 40), job: S(b.job, 30), edu: S(b.edu, 40),
     marital: ['single', 'divorced', 'widowed'].includes(b.marital) ? b.marital : '', children: ['none', 'have', 'want'].includes(b.children) ? b.children : '',
     height: Math.max(0, Math.min(250, Math.floor(+b.height) || prev.height || 0)),
     smoke: ['no', 'sometimes', 'yes'].includes(b.smoke) ? b.smoke : '', drink: ['no', 'sometimes', 'yes'].includes(b.drink) ? b.drink : '',
@@ -498,7 +506,7 @@ route('PUT', '/api/me', {}, (c) => {
     bornMuslim: b.bornMuslim === true ? true : b.bornMuslim === false ? false : (prev.bornMuslim === true || prev.bornMuslim === false ? prev.bornMuslim : null),
     q: Array.isArray(b.q) ? b.q.filter(function (x) { return Array.isArray(x) && x[0] && x[1]; }).map(function (x) { return [S(x[0], 60), S(x[1], 120)]; }).filter(function (x) { return x[0] && x[1]; }).slice(0, 5) : (Array.isArray(prev.q) ? prev.q : []),
     myFilters: (() => { const mf = b.myFilters; if (mf === undefined) return prev.myFilters || null; if (!mf || typeof mf !== 'object') return null; const pick = (src, keys) => { const o = {}; for (const k of keys) if (src[k] !== undefined) o[k] = src[k]; return o; }; return { f: pick(mf.f || {}, ['min', 'max', 'country', 'state', 'city', 'nationality', 'hmin', 'hmax', 'marital', 'children', 'grewUp', 'lang', 'edu', 'profession', 'int', 'marriagePlans', 'relocationPlans', 'familyPlans', 'prayer', 'dress', 'diet', 'smoke', 'drink', 'sect', 'ethnicity']), fg: pick(mf.fg || {}, ['liked', 'bio', 'online', 'goldMember', 'justJoined', 'priv', 'ver', 'born']), fmode: mf.fmode === 'gold' ? 'gold' : 'simple' }; })(),
-    goldUntil: prev.goldUntil || 0, limits: normLimits(prev.limits), travel: travel, blur: !!b.blur, womenFirst: !!b.womenFirst, incog: !!b.incog, dist: b.dist !== false, theme: ['dark', 'light'].includes(b.theme) ? b.theme : '', lang: b.lang === 'en' ? 'en' : 'ps', photos
+    goldUntil: prev.goldUntil || 0, boostUntil: prev.boostUntil || 0, limits: normLimits(prev.limits), travel: travel, blur: !!b.blur, womenFirst: !!b.womenFirst, incog: !!b.incog, dist: b.dist !== false, theme: ['dark', 'light'].includes(b.theme) ? b.theme : '', lang: b.lang === 'en' ? 'en' : 'ps', photos
   };
   if (loc.lat == null) { delete u.me.lat; delete u.me.lng; } else { u.me.lat = loc.lat; u.me.lng = loc.lng; }
   save(); c.json(200, { me: ownMe(u) });
@@ -519,10 +527,11 @@ route('GET', '/api/profiles', {}, (c) => {
     if (o.me.incog && !likedMe) continue;
     out.push(publicProfile(o, u));
   }
+  out.sort(function (a, b) { return (b.boosted ? 1 : 0) - (a.boosted ? 1 : 0); });
   c.json(200, { profiles: out.slice(0, 200) });
 });
 route('GET', '/api/likes-you', {}, (c) => {
-  const u = c.user, ids = [];
+  const u = c.user; if (!isGold(u)) return c.err(403, 'not_gold'); const ids = [];
   for (const o of Object.values(db.users)) { if (o.id !== u.id && hasProfile(o) && !isBlocked(u.id, o.id) && (o.reacts[u.id] === 'like' || o.reacts[u.id] === 'super') && !u.reacts[o.id]) ids.push({ id: o.id, t: (o.reactAt && o.reactAt[u.id]) || 0 }); }
   c.json(200, { ids });
 });
@@ -540,12 +549,18 @@ route('POST', '/api/react', {}, (c) => {
   if (kind !== 'pass') {
     if (o.reacts[u.id] === 'like' || o.reacts[u.id] === 'super') {
       const k = mkey(u.id, id); if (!db.matches[k]) db.matches[k] = { t: Date.now(), msgs: [] };
-      const pushComp = (fromId, text) => { if (text && !db.matches[k].msgs.some(x => x.text === text && x.from === fromId)) db.matches[k].msgs.push({ from: fromId, t: Date.now(), text }); };
+      const pushComp = (fromId, text) => {
+        if (!text) return;
+        // Women-first: a man's compliment must not become the first message while the woman has womenFirst and has not spoken yet — it is held and delivered after her first message (see /api/messages).
+        const from = db.users[fromId], other = db.users[fromId === u.id ? id : u.id];
+        if (from && from.me.g === 'm' && other && other.me.g === 'f' && other.me.womenFirst && !db.matches[k].msgs.some(x => x.from === other.id)) return;
+        if (!db.matches[k].msgs.some(x => x.text === text && x.from === fromId)) db.matches[k].msgs.push({ from: fromId, t: Date.now(), text });
+      };
       if (o.compliments && o.compliments[u.id]) pushComp(o.id, o.compliments[u.id].text);
       pushComp(u.id, compliment);
-      match = true; matchMsgs = db.matches[k].msgs.map(x => viewMsg(x, u.id)); emit(id, { type: 'match', id: u.id, compliment: compliment || '' });
+      match = true; matchMsgs = db.matches[k].msgs.map(x => viewMsg(x, u.id)); emit(id, { type: 'match', from: u.id, compliment: compliment || '' });
     } else {
-      emit(id, { type: 'like', id: u.id });
+      emit(id, { type: 'like', from: u.id });
     }
   }
   save(); c.json(200, { match, msgs: matchMsgs, limits: limitsView(u) });
@@ -577,13 +592,20 @@ route('POST', '/api/messages', {}, (c) => {
   const first = !m.msgs.some(x => x.from === u.id);
   if (first && activeChats(u.id) >= (isGold(u) ? 10 : 5)) return c.err(403, 'chat_limit');
   if (first && o.me.g === 'f' && o.me.womenFirst && !m.msgs.some(x => x.from === to)) return c.err(403, 'women_first');
+  if (!m.msgs.length && Date.now() - m.t > 48 * 3600000) return c.err(403, 'match_expired'); // the first message must go within 48h of matching
+  const cid = typeof c.body.cid === 'string' ? c.body.cid.slice(0, 64) : '';
+  if (cid) { const dup = m.msgs.find(x => x.cid === cid && x.from === u.id); if (dup) return c.json(200, { msg: { t: dup.t }, dup: true }); } // retry after a lost response — do not store twice
   const msg = { from: u.id, t: Date.now() };
+  if (cid) msg.cid = cid;
   if (c.body.text) msg.text = S(c.body.text, 2000);
   else if (c.body.img && u.media.includes(c.body.img)) msg.img = c.body.img;
   else if (c.body.audio && u.media.includes(c.body.audio)) { msg.audio = c.body.audio; msg.dur = Math.min(600, Math.max(1, +c.body.dur || 1)); }
   else return c.err(400, 'empty');
-  m.msgs.push(msg); emit(to, { type: 'message', from: u.id, msg: viewMsg(msg, to) }); save();
-  c.json(200, { msg: { t: msg.t } });
+  m.msgs.push(msg);
+  let held = null;
+  if (first && u.me.g === 'f') { const him = db.users[to]; if (him && him.compliments && him.compliments[u.id]) { const ct = him.compliments[u.id].text; if (ct && !m.msgs.some(x => x.text === ct && x.from === to)) { held = { from: to, t: Date.now(), text: ct }; m.msgs.push(held); } } } // a compliment held by women-first is delivered after her first message, so hers stays first
+  emit(to, { type: 'message', from: u.id, msg: viewMsg(msg, to) }); save();
+  c.json(200, { msg: { t: msg.t }, held: held ? { text: held.text, t: held.t } : null });
 });
 route('POST', '/api/typing', {}, (c) => {
   const u = c.user, to = +c.body.to, o = db.users[to];
@@ -653,13 +675,23 @@ route('POST', '/api/report-problem', {}, (c) => {
 
 route('POST', '/api/photo-request', {}, (c) => {
   const u = c.user, id = +c.body.id;
-  if (!db.matches[mkey(u.id, id)] || isBlocked(u.id, id)) return c.json(200, { status: 'requested' });   // only matches can unlock
+  if (!db.matches[mkey(u.id, id)] || isBlocked(u.id, id)) return c.json(200, { status: 'no_match' });   // only matches can unlock — no dead-end request
   u.unlocked[id] = 1; save(); c.json(200, { status: 'approved' });
 });
 route('POST', '/api/verify', {}, (c) => {
-  const name = saveDataUrl(c.body.selfie, 4e6, 'image/'); if (!name) return c.err(400, 'bad_media');
-  c.user.ver = 1; c.user.selfie = name; save(); emit(c.user.id, { type: 'verify', status: 'pending' });
+  let selfie = null;
+  if (typeof c.body.selfie === 'string' && isStoragePhotoUrl(c.body.selfie)) selfie = c.body.selfie; // Storage URL (preferred — survives restarts)
+  else { const name = saveDataUrl(c.body.selfie, 4e6, 'image/'); if (!name) return c.err(400, 'bad_media'); selfie = name; } // legacy disk upload
+  c.user.ver = 1; c.user.selfie = selfie; save(); emit(c.user.id, { type: 'verify', status: 'pending' });
   c.json(200, { status: 'pending' });
+});
+route('POST', '/api/boost', {}, (c) => {
+  const u = c.user;
+  if (!isGold(u)) return c.err(403, 'not_gold');
+  const now = Date.now();
+  if (u.me.boostUntil && u.me.boostUntil > now) return c.json(200, { ok: true, until: u.me.boostUntil, active: true }); // already boosted — keep the existing end time, do not extend
+  u.me.boostUntil = now + 3 * 3600000; save();
+  c.json(200, { ok: true, until: u.me.boostUntil });
 });
 route('POST', '/api/checkout', {}, async (c) => {
   if (DEV_GOLD) { c.user.gold = true; save(); return c.json(200, { ok: true, trial: true }); }
@@ -667,6 +699,7 @@ route('POST', '/api/checkout', {}, async (c) => {
   if (!rate('checkout:' + c.user.id, 5, 3600000)) return c.err(429, 'rate_limited');
   const u = c.user;
   if (isGold(u)) return c.json(200, { ok: true, active: true });   // already Gold — nothing to buy
+  const _now = Date.now(); for (const _oid in db.goldOrders) { const _o = db.goldOrders[_oid]; if (_o.uid === u.id && _o.status === 'pending' && _o.url && _now - _o.created < 30 * 60000) return c.json(200, { ok: true, url: _o.url, order: _oid, afn: _o.afn, reused: true }); } // a double-tap reuses the pending session, it never creates a second one
   const afn = Math.max(1, Math.round(GOLD_PRICE_USD * await afnRate()));
   const orderId = 'gold-' + u.id + '-' + crypto.randomBytes(4).toString('hex');
   const email = (u.contact || '').indexOf('@') >= 0 ? u.contact : '';
@@ -681,7 +714,7 @@ route('POST', '/api/checkout', {}, async (c) => {
   let res;
   try { res = await hesabpayCreateSession(payload); } catch (e) { console.error('hesabpay create-session failed:', e.message); return c.err(500, 'server_error'); }
   if (!res || typeof res.url !== 'string' || !res.url) return c.err(500, 'server_error');
-  db.goldOrders[orderId] = { uid: u.id, afn: afn, usd: GOLD_PRICE_USD, created: Date.now(), status: 'pending' };
+  db.goldOrders[orderId] = { uid: u.id, afn: afn, usd: GOLD_PRICE_USD, created: Date.now(), status: 'pending', url: res.url };
   save();
   c.json(200, { ok: true, url: res.url, order: orderId, afn: afn });
 });
@@ -729,7 +762,7 @@ const admin = fn => (c) => (ADMIN_KEY && c.req.headers['x-admin-key'] === ADMIN_
    ADMIN_EMAIL (case-insensitive). If ADMIN_EMAIL is unset, nobody is admin. */
 const isAdminUser = u => !!(ADMIN_EMAIL && u && u.contact && String(u.contact).toLowerCase() === ADMIN_EMAIL);
 const requireAdmin = fn => (c) => isAdminUser(c.user) ? fn(c) : c.err(403, 'forbidden');
-const pendingVerifications = () => Object.values(db.users).filter(u => u.ver === 1).map(u => ({ id: u.id, name: u.me && u.me.name, selfie: u.selfie || null, selfieUrl: u.selfie ? mediaUrl(u.selfie) : null }));
+const pendingVerifications = () => Object.values(db.users).filter(u => u.ver === 1).map(u => ({ id: u.id, name: u.me && u.me.name, selfie: u.selfie || null, selfieUrl: u.selfie ? (u.selfie.indexOf('http') === 0 ? u.selfie : mediaUrl(u.selfie)) : null }));
 const decideVerification = (id, approve) => { const u = db.users[+id]; if (!u) return null; u.ver = approve ? 2 : 0; emit(u.id, { type: 'verify', status: approve ? 'approved' : 'rejected' }); save(); return u; };
 const listAdminUsers = () => Object.values(db.users).map(u => ({ id: u.id, name: u.me && u.me.name, contact: u.contact, age: u.me && u.me.age, gold: isGold(u), ver: u.ver, joined: u.createdAt || 0 }));
 const listAdminReports = () => db.reports;
@@ -748,6 +781,15 @@ route('POST', '/api/admin/panel/verify', {}, requireAdmin(c => {
 }));
 route('GET', '/api/admin/panel/users', {}, requireAdmin(c => c.json(200, { users: listAdminUsers() })));
 route('GET', '/api/admin/panel/reports', {}, requireAdmin(c => c.json(200, { reports: listAdminReports() })));
+route('POST', '/api/admin/panel/report/resolve', {}, requireAdmin(c => {
+  const r = db.reports.find(x => x.id === +c.body.id); if (!r) return c.err(404, 'bad_code');
+  r.status = 'resolved'; save(); c.json(200, { ok: true });
+}));
+route('POST', '/api/admin/panel/ban', {}, requireAdmin(c => {
+  const id = +c.body.id; if (!db.users[id]) return c.err(404, 'bad_code');
+  matchesOf(id).forEach(k => delete db.matches[k]); delete db.users[id];
+  for (const t in db.sessions) if (db.sessions[t] === id) delete db.sessions[t]; save(); c.json(200, { ok: true });
+}));
 route('POST', '/api/admin/ban', { anon: true }, admin(c => {
   const id = +c.body.id; matchesOf(id).forEach(k => delete db.matches[k]); delete db.users[id];
   for (const t in db.sessions) if (db.sessions[t] === id) delete db.sessions[t]; save(); c.json(200, { ok: true });
