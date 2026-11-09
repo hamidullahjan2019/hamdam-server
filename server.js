@@ -531,7 +531,7 @@ route('GET', '/api/profiles', {}, (c) => {
   c.json(200, { profiles: out.slice(0, 200) });
 });
 route('GET', '/api/likes-you', {}, (c) => {
-  const u = c.user; if (!isGold(u)) return c.err(403, 'not_gold'); const ids = [];
+  const u = c.user; if (!isGold(u)) return c.json(200, { ids: [] }); const ids = []; // free users get an empty list (the live app has no 403 handler here — a 403 breaks its boot)
   for (const o of Object.values(db.users)) { if (o.id !== u.id && hasProfile(o) && !isBlocked(u.id, o.id) && (o.reacts[u.id] === 'like' || o.reacts[u.id] === 'super') && !u.reacts[o.id]) ids.push({ id: o.id, t: (o.reactAt && o.reactAt[u.id]) || 0 }); }
   c.json(200, { ids });
 });
