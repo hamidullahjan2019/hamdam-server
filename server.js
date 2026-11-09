@@ -88,8 +88,9 @@ function isBoosted(u) { return !!u && !!u.me && !!u.me.boostUntil && u.me.boostU
    Gold is OFF while GOLD_ENABLED is false (Hamid's order 2026-11-09) —
    then everyone is a free user (10 likes, 10h refill). */
 const LIMITS_LIKES_PER_DAY = 10;
-const LIMITS_LIKES_PER_DAY_GOLD = 30;
-const LIMITS_COMPLIMENTS_PER_DAY = 1;
+const LIMITS_LIKES_PER_DAY_GOLD = 100;
+const LIMITS_COMPLIMENTS_PER_DAY = 0;
+const LIMITS_COMPLIMENTS_PER_DAY_GOLD = 2;
 const LIMITS_REFILL_MS = 10 * 3600000;
 function normLimits(raw) {
   const r = (raw && typeof raw === 'object') ? raw : {};
@@ -104,13 +105,14 @@ function limitsView(u) {
   const complimentsUsed = (l.complimentsResetAt && now > l.complimentsResetAt) ? 0 : l.complimentsUsed;
   const complimentsResetAt = (l.complimentsResetAt && now > l.complimentsResetAt) ? 0 : l.complimentsResetAt;
   const cap = isGold(u) ? LIMITS_LIKES_PER_DAY_GOLD : LIMITS_LIKES_PER_DAY;
-  return { likesUsed, likesLeft: Math.max(0, cap - likesUsed), likesResetAt, complimentsUsed, complimentsLeft: Math.max(0, LIMITS_COMPLIMENTS_PER_DAY - complimentsUsed), complimentsResetAt };
+  const compCap = isGold(u) ? LIMITS_COMPLIMENTS_PER_DAY_GOLD : LIMITS_COMPLIMENTS_PER_DAY;
+  return { likesUsed, likesLeft: Math.max(0, cap - likesUsed), likesResetAt, complimentsUsed, complimentsLeft: Math.max(0, compCap - complimentsUsed), complimentsResetAt };
 }
 // Returns null when the react may proceed (allowance consumed), or
 // { kind: 'likes'|'compliments', resetAt } when the user is past it.
-// A like/super-like consumes the like allowance (Gold 30, free 10);
+// A like/super-like consumes the like allowance (Gold 100, free 10);
 // a react carrying a compliment also consumes the compliment
-// allowance (free 1/day; Gold unlimited).
+// allowance (Gold 2/day; free users cannot send compliments).
 function consumeLimits(u, countsLike, countsCompliment) {
   if (!u.me || typeof u.me !== 'object') u.me = {};
   const l = normLimits(u.me.limits), now = Date.now();
@@ -118,10 +120,11 @@ function consumeLimits(u, countsLike, countsCompliment) {
   if (l.complimentsResetAt && now > l.complimentsResetAt) { l.complimentsUsed = 0; l.complimentsResetAt = 0; }
   u.me.limits = l;
   const gold = isGold(u), cap = gold ? LIMITS_LIKES_PER_DAY_GOLD : LIMITS_LIKES_PER_DAY;
+  const compCap = gold ? LIMITS_COMPLIMENTS_PER_DAY_GOLD : LIMITS_COMPLIMENTS_PER_DAY;
   if (countsLike && l.likesUsed >= cap) return { kind: 'likes', resetAt: l.likesResetAt || now + LIMITS_REFILL_MS };
-  if (!gold && countsCompliment && l.complimentsUsed >= LIMITS_COMPLIMENTS_PER_DAY) return { kind: 'compliments', resetAt: l.complimentsResetAt || now + LIMITS_REFILL_MS };
+  if (countsCompliment && l.complimentsUsed >= compCap) return { kind: 'compliments', resetAt: l.complimentsResetAt || now + LIMITS_REFILL_MS };
   if (countsLike) { l.likesUsed += 1; if (l.likesUsed >= cap) l.likesResetAt = now + LIMITS_REFILL_MS; }
-  if (!gold && countsCompliment) { l.complimentsUsed += 1; if (l.complimentsUsed >= LIMITS_COMPLIMENTS_PER_DAY) l.complimentsResetAt = now + LIMITS_REFILL_MS; }
+  if (countsCompliment) { l.complimentsUsed += 1; if (l.complimentsUsed >= compCap) l.complimentsResetAt = now + LIMITS_REFILL_MS; }
   return null;
 }
 async function afnRate() {
