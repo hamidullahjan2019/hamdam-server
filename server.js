@@ -66,6 +66,7 @@ const USE_SB = !!(SB_URL && SB_SERVICE);       // Supabase store enabled only wh
    from the previous profile, exactly like myFilters. */
 const GOLD_PRICE_USD = 5;
 const GOLD_DAYS = 30;
+const GOLD_PROMO_UNTIL = Date.parse('2027-01-01T00:00:00Z'); // Gold is FREE for everyone until 1 Jan 2027, then $5/month
 const GOLD_DAY_MS = 86400000;
 const HESABPAY_KEY = process.env.HESABPAY_API_KEY || '';
 const HESABPAY_LIVE = 'https://api.hesab.com';
@@ -73,7 +74,7 @@ const HESABPAY_SANDBOX = 'https://api-sandbox.hesab.com';
 const HESABPAY_BASE = process.env.HESABPAY_BASE_URL || (process.env.HESABPAY_ENV === 'sandbox' ? HESABPAY_SANDBOX : HESABPAY_LIVE);
 const HESABPAY_FALLBACK_RATE = 70;   // AFN per USD — used only if the live rate fetch fails
 const APP_URL = 'https://fastidious-pixie-4c8929.netlify.app';   // return URL host for Gold payments
-function isGold(u) { return !!u && !!u.gold && !(u.me && u.me.goldUntil && u.me.goldUntil <= Date.now()); }
+function isGold(u) { if (!u) return false; if (Date.now() < GOLD_PROMO_UNTIL) return true; return !!u.gold && !(u.me && u.me.goldUntil && u.me.goldUntil <= Date.now()); }
 function isBoosted(u) { return !!u && !!u.me && !!u.me.boostUntil && u.me.boostUntil > Date.now(); }
 
 /* ---------- free daily limits (batch 3, item 2) ----------
@@ -328,7 +329,7 @@ function publicProfile(u, viewer) {
     joined: u.createdAt || 0, gold: isGold(u), filters: (viewer && isGold(viewer)) ? (me.myFilters || null) : null, seen: u.seen || 0, bornMuslim: (me.bornMuslim === true || me.bornMuslim === false) ? me.bornMuslim : null,
     ver: u.ver === 2, priv: !!me.blur, photos: (!me.blur || unlocked) ? (me.photos || []) : [], dist: dist, online: Date.now() - (u.seen || 0) < 120000, boosted: isBoosted(u) };
 }
-function ownMe(u) { const o = Object.assign({}, u.me, { id: u.id, contact: u.contact, ver: u.ver, gold: isGold(u), done: true, joined: u.createdAt || 0 }); delete o.lat; delete o.lng; o.loc = validLoc(u.me.lat, u.me.lng); o.limits = limitsView(u); return o; }
+function ownMe(u) { const o = Object.assign({}, u.me, { id: u.id, contact: u.contact, ver: u.ver, gold: isGold(u), done: true, joined: u.createdAt || 0 }); delete o.lat; delete o.lng; o.loc = validLoc(u.me.lat, u.me.lng); o.limits = limitsView(u); const promo = Date.now() < GOLD_PROMO_UNTIL, realGold = !!u.gold && !(u.me && u.me.goldUntil && u.me.goldUntil <= Date.now()); o.goldPromo = promo && !realGold; if (promo && !realGold) o.goldUntil = GOLD_PROMO_UNTIL; return o; }
 function stateFor(u) {
   const matches = {}; for (const k of matchesOf(u.id)) { const m = db.matches[k], o = otherOf(k, u.id); matches[o] = { t: m.t, unread: m.msgs.filter(x => x.from !== u.id && !x.readAt).length, msgs: m.msgs.map(x => viewMsg(x, u.id)) }; }
   const acted = {}; for (const k in u.reacts) acted[k] = u.reacts[k];
@@ -356,12 +357,20 @@ const mediaUrl = n => PUBLIC_URL + '/media/' + n;
    supabase-storage-photos.sql). /media on local disk stays as a fallback
    for already-uploaded files and for voice audio, which is out of scope. */
 const SB_BUCKET = 'hamdam-photos';
+const VIDEO_BUCKET = 'hamdam-videos';
 const storagePublicPrefix = () => SB_URL + '/storage/v1/object/public/' + SB_BUCKET + '/';
 function isStoragePhotoUrl(x) {
   if (typeof x !== 'string' || !SB_URL) return false;
   if (!x.startsWith(storagePublicPrefix())) return false;
   const rest = x.slice(storagePublicPrefix().length);
   return rest.length > 0 && rest.length <= 200 && /^[A-Za-z0-9][A-Za-z0-9._\-\/]*$/.test(rest) && !rest.includes('..') && /\.(jpg|jpeg|png|webp)$/i.test(rest);
+}
+
+function isStorageVideoUrl(x) {
+  if (typeof x !== 'string' || !SB_URL) return false;
+  if (!x.startsWith(SB_URL + '/storage/v1/object/public/' + VIDEO_BUCKET + '/')) return false;
+  const rest = x.slice((SB_URL + '/storage/v1/object/public/' + VIDEO_BUCKET + '/').length);
+  return rest.length > 0 && rest.length <= 200 && /^[A-Za-z0-9][A-Za-z0-9._\-\/]*$/.test(rest) && !rest.includes('..') && /\.(mp4|mov|webm)$/i.test(rest);
 }
 
 /* ---------- routes ---------- */
@@ -511,7 +520,7 @@ route('PUT', '/api/me', {}, (c) => {
     bornMuslim: b.bornMuslim === true ? true : b.bornMuslim === false ? false : (prev.bornMuslim === true || prev.bornMuslim === false ? prev.bornMuslim : null),
     q: Array.isArray(b.q) ? b.q.filter(function (x) { return Array.isArray(x) && x[0] && x[1]; }).map(function (x) { return [S(x[0], 60), S(x[1], 120)]; }).filter(function (x) { return x[0] && x[1]; }).slice(0, 5) : (Array.isArray(prev.q) ? prev.q : []),
     myFilters: (() => { const mf = b.myFilters; if (mf === undefined) return prev.myFilters || null; if (!mf || typeof mf !== 'object') return null; const pick = (src, keys) => { const o = {}; for (const k of keys) if (src[k] !== undefined) o[k] = src[k]; return o; }; return { f: pick(mf.f || {}, ['min', 'max', 'country', 'state', 'city', 'nationality', 'hmin', 'hmax', 'marital', 'children', 'grewUp', 'lang', 'edu', 'profession', 'int', 'marriagePlans', 'relocationPlans', 'familyPlans', 'prayer', 'dress', 'diet', 'smoke', 'drink', 'sect', 'ethnicity']), fg: pick(mf.fg || {}, ['liked', 'bio', 'online', 'goldMember', 'justJoined', 'priv', 'ver', 'born']), fmode: mf.fmode === 'gold' ? 'gold' : 'simple' }; })(),
-    goldUntil: prev.goldUntil || 0, boostUntil: prev.boostUntil || 0, limits: normLimits(prev.limits), travel: travel, blur: !!b.blur, womenFirst: !!b.womenFirst, incog: !!b.incog, dist: b.dist !== false, theme: ['dark', 'light'].includes(b.theme) ? b.theme : '', lang: b.lang === 'en' ? 'en' : 'ps', photos
+    goldUntil: prev.goldUntil || 0, boostUntil: prev.boostUntil || 0, verifyVideo: prev.verifyVideo || null, limits: normLimits(prev.limits), travel: travel, blur: !!b.blur, womenFirst: !!b.womenFirst, incog: !!b.incog, dist: b.dist !== false, theme: ['dark', 'light'].includes(b.theme) ? b.theme : '', lang: b.lang === 'en' ? 'en' : 'ps', photos
   };
   if (loc.lat == null) { delete u.me.lat; delete u.me.lng; } else { u.me.lat = loc.lat; u.me.lng = loc.lng; }
   save(); c.json(200, { me: ownMe(u) });
@@ -684,10 +693,14 @@ route('POST', '/api/photo-request', {}, (c) => {
   u.unlocked[id] = 1; save(); c.json(200, { status: 'approved' });
 });
 route('POST', '/api/verify', {}, (c) => {
-  let selfie = null;
-  if (typeof c.body.selfie === 'string' && isStoragePhotoUrl(c.body.selfie)) selfie = c.body.selfie; // Storage URL (preferred — survives restarts)
-  else { const name = saveDataUrl(c.body.selfie, 4e6, 'image/'); if (!name) return c.err(400, 'bad_media'); selfie = name; } // legacy disk upload
-  c.user.ver = 1; c.user.selfie = selfie; save(); emit(c.user.id, { type: 'verify', status: 'pending' });
+  let selfie = null, video = null;
+  if (typeof c.body.selfie === 'string' && c.body.selfie && isStoragePhotoUrl(c.body.selfie)) selfie = c.body.selfie; // Storage URL (preferred — survives restarts)
+  else if (typeof c.body.selfie === 'string' && c.body.selfie) { const name = saveDataUrl(c.body.selfie, 4e6, 'image/'); if (name) selfie = name; } // legacy disk upload (best effort)
+  if (typeof c.body.video === 'string' && c.body.video && isStorageVideoUrl(c.body.video)) video = c.body.video; // Storage video URL
+  if (!selfie && !video) return c.err(400, 'bad_media');
+  if (selfie) c.user.selfie = selfie;
+  if (video) { c.user.me = c.user.me || {}; c.user.me.verifyVideo = video; }
+  c.user.ver = 1; save(); emit(c.user.id, { type: 'verify', status: 'pending' });
   c.json(200, { status: 'pending' });
 });
 route('POST', '/api/boost', {}, (c) => {
@@ -749,7 +762,7 @@ route('POST', '/api/hesabpay/webhook', { anon: true }, async (c) => {
   c.json(200, { ok: true, paid: true });
 });
 route('GET', '/api/config', { anon: true }, (c) => {
-  c.json(200, { supabaseUrl: SB_URL, supabaseAnonKey: SB_ANON, storageBucket: SB_BUCKET, storageConfigured: !!(SB_URL && SB_ANON) });
+  c.json(200, { supabaseUrl: SB_URL, supabaseAnonKey: SB_ANON, storageBucket: SB_BUCKET, videoBucket: VIDEO_BUCKET, storageConfigured: !!(SB_URL && SB_ANON) });
 });
 route('GET', '/api/health', { anon: true }, (c) => {
   c.json(200, { ok: true, store: USE_SB ? 'supabase' : 'json', time: Date.now() });
@@ -767,7 +780,7 @@ const admin = fn => (c) => (ADMIN_KEY && c.req.headers['x-admin-key'] === ADMIN_
    ADMIN_EMAIL (case-insensitive). If ADMIN_EMAIL is unset, nobody is admin. */
 const isAdminUser = u => !!(ADMIN_EMAIL && u && u.contact && String(u.contact).toLowerCase() === ADMIN_EMAIL);
 const requireAdmin = fn => (c) => isAdminUser(c.user) ? fn(c) : c.err(403, 'forbidden');
-const pendingVerifications = () => Object.values(db.users).filter(u => u.ver === 1).map(u => ({ id: u.id, name: u.me && u.me.name, selfie: u.selfie || null, selfieUrl: u.selfie ? (u.selfie.indexOf('http') === 0 ? u.selfie : mediaUrl(u.selfie)) : null }));
+const pendingVerifications = () => Object.values(db.users).filter(u => u.ver === 1).map(u => ({ id: u.id, name: u.me && u.me.name, selfie: u.selfie || null, selfieUrl: u.selfie ? (u.selfie.indexOf('http') === 0 ? u.selfie : mediaUrl(u.selfie)) : null, video: (u.me && u.me.verifyVideo) || null, videoUrl: (u.me && u.me.verifyVideo) || null, photos: (u.me && u.me.photos) || [] }));
 const decideVerification = (id, approve) => { const u = db.users[+id]; if (!u) return null; u.ver = approve ? 2 : 0; emit(u.id, { type: 'verify', status: approve ? 'approved' : 'rejected' }); save(); return u; };
 const listAdminUsers = () => Object.values(db.users).map(u => ({ id: u.id, name: u.me && u.me.name, contact: u.contact, age: u.me && u.me.age, gold: isGold(u), ver: u.ver, joined: u.createdAt || 0 }));
 const listAdminReports = () => db.reports;
