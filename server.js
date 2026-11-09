@@ -491,7 +491,7 @@ route('PUT', '/api/me', {}, (c) => {
     } else return c.err(400, 'travel_invalid');
   }
   const loc = parseLoc(b, prev);
-  const photos = (Array.isArray(b.photos) ? b.photos : []).filter(x => u.media.includes(x)).slice(0, 3);
+  const photos = (Array.isArray(b.photos) ? b.photos : []).filter(x => u.media.includes(x)).slice(0, 6);
   const username = (b.username || '').toLowerCase().replace(/[^a-z0-9._-]/g, '').slice(0, 20);
   if (username && !/[a-z0-9]/.test(username)) return c.err(400, 'bad_username'); // a username needs at least one letter or number
   if (username && username !== (prev.username || '') && Object.values(db.users).some(x => x.id !== u.id && x.me && x.me.username === username)) return c.err(400, 'username_taken');
