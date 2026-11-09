@@ -329,7 +329,7 @@ function publicProfile(u, viewer) {
   const me = u.me, unlocked = !!(viewer.unlocked && viewer.unlocked[u.id]);
   const tr = activeTravel(me);
   const dist = (!tr && me.dist !== false && viewer && viewer.me && validLoc(viewer.me.lat, viewer.me.lng) && validLoc(me.lat, me.lng)) ? haversineKm(viewer.me.lat, viewer.me.lng, me.lat, me.lng) : null;
-  return { id: u.id, name: me.name, username: me.username || '', age: me.age, height: me.height || 0, country: tr ? tr.country : (me.country || ''), state: tr ? (tr.state || me.state || '') : (me.state || ''), city: tr ? tr.city : me.city, job: me.job, edu: me.edu || '', marital: me.marital || '', children: me.children || '', smoke: me.smoke || '', drink: me.drink || '', g: me.g, intent: me.intent, prayer: me.prayer, langs: me.langs || '', about: me.about, q: me.q || [], int: me.int || [],
+  return { id: u.id, name: me.name, lastName: me.lastName || '', age: me.age, height: me.height || 0, country: tr ? tr.country : (me.country || ''), state: tr ? (tr.state || me.state || '') : (me.state || ''), city: tr ? tr.city : '', job: me.job, edu: me.edu || '', marital: me.marital || '', children: me.children || '', smoke: me.smoke || '', drink: me.drink || '', exercise: me.exercise || '', pets: me.pets || '', g: me.g, intent: me.intent, prayer: me.prayer, langs: me.langs || '', about: me.about, q: me.q || [], int: me.int || [],
     nationality: me.nationality || '', grewUp: me.grewUp || '', sect: me.sect || '', ethnicity: me.ethnicity || '', marriagePlans: me.marriagePlans || '', relocationPlans: me.relocationPlans || '', familyPlans: me.familyPlans || '', dress: me.dress || '', diet: me.diet || '', faith: me.faith || [], personality: me.personality || [], polygamy: me.polygamy || '', parents: me.parents || '', top3: me.top3 || '',
     joined: u.createdAt || 0, gold: isGold(u), filters: (viewer && isGold(viewer)) ? (me.myFilters || null) : null, seen: u.seen || 0, bornMuslim: (me.bornMuslim === true || me.bornMuslim === false) ? me.bornMuslim : null,
     ver: u.ver === 2, priv: !!me.blur, photos: (!me.blur || unlocked) ? (me.photos || []) : [], dist: dist, online: Date.now() - (u.seen || 0) < 120000, boosted: isBoosted(u) };
@@ -489,7 +489,7 @@ route('GET', '/api/me', {}, (c) => {
 });
 route('PUT', '/api/me', {}, (c) => {
   const b = c.body, u = c.user, age = Math.floor(+b.age);
-  if (!(age >= 18 && age <= 90)) return c.err(400, 'age_invalid');
+  if (!(age >= 18 && age <= 120)) return c.err(400, 'age_invalid');
   const prev = u.me || {};
   var travel = (prev.travel && typeof prev.travel === 'object') ? prev.travel : null;
   if (b.travel !== undefined) {
@@ -506,25 +506,22 @@ route('PUT', '/api/me', {}, (c) => {
   }
   const loc = parseLoc(b, prev);
   const photos = (Array.isArray(b.photos) ? b.photos : []).filter(x => u.media.includes(x)).slice(0, 6);
-  const username = (b.username || '').toLowerCase().replace(/[^a-z0-9._-]/g, '').slice(0, 20);
-  if (username && !/[a-z0-9]/.test(username)) return c.err(400, 'bad_username'); // a username needs at least one letter or number
-  if (username && username !== (prev.username || '') && Object.values(db.users).some(x => x.id !== u.id && x.me && x.me.username === username)) return c.err(400, 'username_taken');
   u.me = {
-    name: S(b.name, 24) || 'You', username: username, age, country: S(b.country, 40), state: S(b.state, 40), city: S(b.city, 40), job: S(b.job, 30), edu: S(b.edu, 40),
-    marital: ['single', 'divorced', 'widowed'].includes(b.marital) ? b.marital : '', children: ['none', 'have', 'want'].includes(b.children) ? b.children : '',
+    name: S(b.name, 24) || 'You', lastName: S(b.lastName, 24), age, country: S(b.country, 40), state: S(b.state, 40), job: S(b.job, 30), edu: S(b.edu, 40),
+    marital: ['single', 'divorced', 'widowed', 'engaged', 'married', 'separated', 'annulled'].includes(b.marital) ? b.marital : '', children: ['none', 'have', 'want'].includes(b.children) ? b.children : '',
     height: Math.max(0, Math.min(250, Math.floor(+b.height) || prev.height || 0)),
-    smoke: ['no', 'sometimes', 'yes'].includes(b.smoke) ? b.smoke : '', drink: ['no', 'sometimes', 'yes'].includes(b.drink) ? b.drink : '',
+    smoke: ['no', 'sometimes', 'yes'].includes(b.smoke) ? b.smoke : '', drink: ['no', 'sometimes', 'yes'].includes(b.drink) ? b.drink : '', exercise: ['never', 'sometimes', 'regular', 'daily'].includes(b.exercise) ? b.exercise : '', pets: ['none', 'dog', 'cat', 'other'].includes(b.pets) ? b.pets : '',
     about: S(b.about, 140), g: b.g === 'f' ? 'f' : 'm',
     intent: ['marriage', 'friends', 'both'].includes(b.intent) ? b.intent : 'both', prayer: ['a', 's', 't'].includes(b.prayer) ? b.prayer : 'a',
-    int: (Array.isArray(b.int) ? b.int : []).map(x => S(x, 20)).slice(0, 10), langs: S(b.langs, 120),
+    int: (Array.isArray(b.int) ? b.int : []).map(x => S(x, 20)).slice(0, 3), langs: S(b.langs, 120),
     nationality: S(b.nationality, 40), grewUp: S(b.grewUp, 40), sect: S(b.sect, 40), ethnicity: S(b.ethnicity, 40),
-    marriagePlans: ['soon', 'year', 'two', 'unsure'].includes(b.marriagePlans) ? b.marriagePlans : '', relocationPlans: ['open', 'global', 'no', 'unsure'].includes(b.relocationPlans) ? b.relocationPlans : '', familyPlans: ['want', 'notwant', 'unsure', 'have'].includes(b.familyPlans) ? b.familyPlans : '',
+    marriagePlans: ['soon', 'month1', 'month3', 'year', 'two', 'unsure'].includes(b.marriagePlans) ? b.marriagePlans : '', relocationPlans: ['open', 'global', 'no', 'unsure'].includes(b.relocationPlans) ? b.relocationPlans : '', familyPlans: ['want', 'notwant', 'unsure', 'have'].includes(b.familyPlans) ? b.familyPlans : '',
     dress: S(b.dress, 20), diet: ['halal', 'veg', 'vegan', 'any'].includes(b.diet) ? b.diet : '',
-    faith: (Array.isArray(b.faith) ? b.faith : []).map(x => S(x, 30)).slice(0, 12), personality: (Array.isArray(b.personality) ? b.personality : []).map(x => S(x, 20)).slice(0, 12),
+    faith: (Array.isArray(b.faith) ? b.faith : []).map(x => S(x, 30)).slice(0, 3), personality: (Array.isArray(b.personality) ? b.personality : []).map(x => S(x, 20)).slice(0, 3),
     polygamy: ['no', 'open', 'unsure'].includes(b.polygamy) ? b.polygamy : '', parents: S(b.parents, 80), top3: S(b.top3, 120),
     bornMuslim: b.bornMuslim === true ? true : b.bornMuslim === false ? false : (prev.bornMuslim === true || prev.bornMuslim === false ? prev.bornMuslim : null),
     q: Array.isArray(b.q) ? b.q.filter(function (x) { return Array.isArray(x) && x[0] && x[1]; }).map(function (x) { return [S(x[0], 60), S(x[1], 120)]; }).filter(function (x) { return x[0] && x[1]; }).slice(0, 5) : (Array.isArray(prev.q) ? prev.q : []),
-    myFilters: (() => { const mf = b.myFilters; if (mf === undefined) return prev.myFilters || null; if (!mf || typeof mf !== 'object') return null; const pick = (src, keys) => { const o = {}; for (const k of keys) if (src[k] !== undefined) o[k] = src[k]; return o; }; return { f: pick(mf.f || {}, ['min', 'max', 'country', 'state', 'city', 'nationality', 'hmin', 'hmax', 'marital', 'children', 'grewUp', 'lang', 'edu', 'profession', 'int', 'marriagePlans', 'relocationPlans', 'familyPlans', 'prayer', 'dress', 'diet', 'smoke', 'drink', 'sect', 'ethnicity']), fg: pick(mf.fg || {}, ['liked', 'bio', 'online', 'goldMember', 'justJoined', 'priv', 'ver', 'born']), fmode: mf.fmode === 'gold' ? 'gold' : 'simple' }; })(),
+    myFilters: (() => { const mf = b.myFilters; if (mf === undefined) return prev.myFilters || null; if (!mf || typeof mf !== 'object') return null; const pick = (src, keys) => { const o = {}; for (const k of keys) if (src[k] !== undefined) o[k] = src[k]; return o; }; return { f: pick(mf.f || {}, ['min', 'max', 'country', 'state', 'nationality', 'hmin', 'hmax', 'marital', 'children', 'grewUp', 'lang', 'edu', 'profession', 'int', 'marriagePlans', 'relocationPlans', 'familyPlans', 'prayer', 'dress', 'diet', 'smoke', 'drink', 'sect', 'ethnicity']), fg: pick(mf.fg || {}, ['liked', 'bio', 'online', 'goldMember', 'justJoined', 'priv', 'ver', 'born']), fmode: mf.fmode === 'gold' ? 'gold' : 'simple' }; })(),
     goldUntil: prev.goldUntil || 0, boostUntil: prev.boostUntil || 0, verifyVideo: prev.verifyVideo || null, limits: normLimits(prev.limits), travel: travel, blur: !!b.blur, womenFirst: !!b.womenFirst, incog: !!b.incog, dist: b.dist !== false, theme: ['dark', 'light'].includes(b.theme) ? b.theme : '', lang: b.lang === 'en' ? 'en' : 'ps', photos
   };
   if (loc.lat == null) { delete u.me.lat; delete u.me.lng; } else { u.me.lat = loc.lat; u.me.lng = loc.lng; }
