@@ -584,6 +584,21 @@ route('POST', '/api/react', {}, (c) => {
   }
   save(); c.json(200, { match, msgs: matchMsgs, limits: limitsView(u) });
 });
+route('POST', '/api/compliment', {}, (c) => {
+  const u = c.user, id = +c.body.id, o = db.users[id];
+  const text = S(c.body.text, 120);
+  if (!text || !o || o.id === u.id || o.me.g === u.me.g || isBlocked(u.id, id)) return c.err(400, 'blocked');
+  if (!hasProfile(u) || !hasProfile(o)) return c.err(400, 'no_profile');
+  if (!u.reacts[id] || u.reacts[id] === 'pass') return c.err(400, 'not_liked');
+  const limitBlock = consumeLimits(u, false, true);
+  if (limitBlock) return c.json(403, { error: 'limit_reached', kind: limitBlock.kind, resetAt: limitBlock.resetAt });
+  const k = mkey(u.id, id), m = db.matches[k];
+  if (m) {
+    if (u.me.g === 'm' && o.me.g === 'f' && o.me.womenFirst && !m.msgs.some(x => x.from === o.id)) { u.compliments = u.compliments || {}; u.compliments[id] = { text, t: Date.now() }; }
+    else { const msg = { from: u.id, t: Date.now(), text }; m.msgs.push(msg); emit(id, { type: 'message', from: u.id, msg: viewMsg(msg, id) }); }
+  } else { u.compliments = u.compliments || {}; u.compliments[id] = { text, t: Date.now() }; }
+  save(); c.json(200, { ok: true, matched: !!m, limits: limitsView(u) });
+});
 route('POST', '/api/visit', {}, (c) => {
   const u = c.user, id = +c.body.id, o = db.users[id];
   if (!hasProfile(u) || !hasProfile(o) || o.id === u.id || isBlocked(u.id, id) || u.me.incog) return c.json(200, { ok: true });
