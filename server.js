@@ -188,7 +188,7 @@ fs.mkdirSync(UPLOADS, { recursive: true });
    mirroring the JSON structure 1:1. OTP codes are NOT stored here in
    Supabase mode — they live in Supabase Auth (see sendOtpEmail). */
 let db = { seq: 1, users: {}, sessions: {}, matches: {}, reports: [], events: {}, goldOrders: {} };
-function loadJson() { try { db = Object.assign(db, JSON.parse(fs.readFileSync(DATA_FILE, 'utf8'))); } catch (e) { /* first run: keep empty db */ } }
+function loadJson() { try { db = Object.assign(db, JSON.parse(fs.readFileSync(DATA_FILE, 'utf8'))); for (const t in db.sessions) { const v = db.sessions[t]; if (typeof v === 'number') db.sessions[t] = { uid: v, iat: 0 }; } } catch (e) { /* first run: keep empty db */ } }
 const otps = {}, hits = {};            // volatile (JSON mode OTPs + rate limits)
 
 /* --- Supabase REST client (PostgREST, zero dependencies, global fetch) --- */
@@ -227,7 +227,7 @@ async function storeLoad() {               // Supabase -> in-memory db (throws o
   ]);
   db = { seq: 1, users: {}, sessions: {}, matches: {}, reports: [], events: {}, goldOrders: {} };
   for (const r of users) db.users[r.id] = userFromRow(r);
-  for (const r of sessions) db.sessions[r.token] = r.user_id;
+  for (const r of sessions) db.sessions[r.token] = { uid: r.user_id, iat: r.created_at || 0 };
   for (const r of matches) db.matches[r.match_key] = { t: r.t, msgs: r.msgs || [] };
   db.reports = reports.map(reportFromRow).sort((a, b) => a.id - b.id);
   for (const r of events) db.events[r.user_id] = r.events || [];
@@ -255,7 +255,7 @@ async function persistOnce() {             // diff lastSynced snapshot -> Supaba
     for (const k of dels) await sbDelete(table, pkCol, k);
   };
   await diffMap(prev.users, db.users, userToRow, 'users', 'id');
-  await diffMap(prev.sessions, db.sessions, (uid, token) => ({ token, user_id: uid, created_at: 0 }), 'sessions', 'token');
+  await diffMap(prev.sessions, db.sessions, (v, token) => ({ token, user_id: v.uid, created_at: v.iat || 0 }), 'sessions', 'token');
   await diffMap(prev.matches, db.matches, (m, k) => ({ match_key: k, t: m.t, msgs: m.msgs }), 'matches', 'match_key');
   const prevRep = new Map((prev.reports || []).map(r => [r.id, JSON.stringify(r)]));
   await sbUpsert('reports', db.reports.filter(r => JSON.stringify(r) !== prevRep.get(r.id)).map(reportToRow), 'id');
@@ -427,7 +427,7 @@ async function verifyOtpEmail(contact, code) {
 function sessionForContact(contact) {
   let u = Object.values(db.users).find(x => x.contact === contact);
   if (!u) { u = db.users[db.seq] = { id: db.seq++, contact, me: null, ver: 0, gold: false, blocked: {}, reacts: {}, hist: [], unlocked: {}, media: [], createdAt: Date.now(), compliments: {}, reactAt: {}, visits: {} }; }
-  const token = crypto.randomBytes(32).toString('hex'); db.sessions[token] = u.id; save();
+  const token = crypto.randomBytes(32).toString('hex'); db.sessions[token] = { uid: u.id, iat: Date.now() }; save();
   return token;
 }
 async function supabaseUserByToken(token) {
@@ -533,7 +533,7 @@ route('PUT', '/api/me', {}, (c) => {
 route('DELETE', '/api/me', {}, (c) => {
   const id = c.user.id;
   matchesOf(id).forEach(k => delete db.matches[k]); delete db.users[id]; delete db.events[id];
-  for (const t in db.sessions) if (db.sessions[t] === id) delete db.sessions[t];
+  for (const t in db.sessions) if (db.sessions[t] && db.sessions[t].uid === id) delete db.sessions[t];
   save(); c.json(200, { ok: true });
 });
 
@@ -672,7 +672,7 @@ route('POST', '/api/media-url', {}, (c) => {
 });
 
 route('POST', '/api/unmatch', {}, (c) => { delete db.matches[mkey(c.user.id, +c.body.id)]; save(); c.json(200, { ok: true }); });
-route('POST', '/api/block', {}, (c) => { const id = +c.body.id; if (db.users[id]) { c.user.blocked[id] = 1; delete db.matches[mkey(c.user.id, id)]; save(); } c.json(200, { ok: true }); });
+route('POST', '/api/block', {}, (c) => { const id = +c.body.id; if (db.users[id]) { c.user.blocked[id] = 1; c.user.reacts[id] = c.user.reacts[id] || 'pass'; if (c.user.hist.indexOf(id) < 0) c.user.hist.push(id); delete db.matches[mkey(c.user.id, id)]; save(); } c.json(200, { ok: true }); });
 route('POST', '/api/unblock', {}, (c) => { delete c.user.blocked[+c.body.id]; save(); c.json(200, { ok: true }); });
 route('POST', '/api/report', {}, (c) => {
   const id = +c.body.id; if (!db.users[id]) return c.err(400, 'blocked');
@@ -811,11 +811,11 @@ route('POST', '/api/admin/panel/report/resolve', {}, requireAdmin(c => {
 route('POST', '/api/admin/panel/ban', {}, requireAdmin(c => {
   const id = +c.body.id; if (!db.users[id]) return c.err(404, 'bad_code');
   matchesOf(id).forEach(k => delete db.matches[k]); delete db.users[id];
-  for (const t in db.sessions) if (db.sessions[t] === id) delete db.sessions[t]; save(); c.json(200, { ok: true });
+  for (const t in db.sessions) if (db.sessions[t] && db.sessions[t].uid === id) delete db.sessions[t]; save(); c.json(200, { ok: true });
 }));
 route('POST', '/api/admin/ban', { anon: true }, admin(c => {
   const id = +c.body.id; matchesOf(id).forEach(k => delete db.matches[k]); delete db.users[id];
-  for (const t in db.sessions) if (db.sessions[t] === id) delete db.sessions[t]; save(); c.json(200, { ok: true });
+  for (const t in db.sessions) if (db.sessions[t] && db.sessions[t].uid === id) delete db.sessions[t]; save(); c.json(200, { ok: true });
 }));
 
 /* ---------- http ---------- */
@@ -855,8 +855,9 @@ const server = http.createServer((req, res) => {
       if (r.method !== req.method) continue; const m = r.re.exec(url.pathname); if (!m) continue;
       const c = { req, body, ip, query: url.searchParams, params: m.groups || {}, json: (s, b) => json(res, s, b, req), err: (s, code) => err(res, s, code, req) };
       if (!r.opts.anon) {
-        const h = req.headers.authorization || '', token = h.startsWith('Bearer ') ? h.slice(7) : '', uid = db.sessions[token];
+        const h = req.headers.authorization || '', token = h.startsWith('Bearer ') ? h.slice(7) : ''; let sess = db.sessions[token]; if (typeof sess === 'number') sess = db.sessions[token] = { uid: sess, iat: 0 }; const uid = sess && sess.uid;
         if (!uid || !db.users[uid]) return err(res, 401, 'unauthorized', req);
+        if (!sess.iat) { sess.iat = Date.now(); save(); } else if (Date.now() - sess.iat > 30 * 24 * 60 * 60 * 1000) { delete db.sessions[token]; save(); return err(res, 401, 'unauthorized', req); }
         c.token = token; c.user = db.users[uid]; c.user.seen = Date.now();
       }
       try {
